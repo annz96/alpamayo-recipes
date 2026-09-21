@@ -130,7 +130,7 @@ worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个wo
 **收益**:分三组场景测试
 - **S1,同node配对A/B**:stall gap(每step因stall多花的时间)**−0.050s/step**;severe负担**−33%~−45%**;副作用检查——即使完全没撞上重样本的"干净路径",代价也只**+1.6%**（落在±2%的节点噪声范围内,基本可以认为无额外开销）
 - **S2,6-worker(worker池小,单点重样本更容易拖垮全局)**:叠加"懒加载+受限解码并发"后,severe steps **18.27%→10.00%**("prefetch4+懒加载+解码并发"三者一起叠加的效果)
-- **S2,10-worker(worker池够大 + 瓶颈见02)**:severe steps **16.5%→16.5%,无效**。原因:①池子够大时,一个worker卡住,其余worker能顶上,不再是短板;②S2这里的severe stall根源其实是[02_Dataloader_Preprocessing_cn.md](02_Dataloader_Preprocessing_cn.md)里 allocator/32MB mmap阈值问题,跟"重样本长尾延迟"是两种情况。
+- **S2,10-worker(worker池够大 + 瓶颈见下文CPU预处理相关技术)**:severe steps **16.5%→16.5%,无效**。原因:①池子够大时,一个worker卡住,其余worker能顶上,不再是短板;②S2这里的severe stall根源其实是 allocator/32MB mmap阈值问题(CPU预处理小节),跟"重样本长尾延迟"是两种情况。
 
 **实现**:多相机解码调度逻辑
 
