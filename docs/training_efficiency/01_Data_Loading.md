@@ -43,7 +43,7 @@ if tensors is None:
 tensors[output_slots[cur_frame_idx]].copy_(frame_tensor)  # copy in-place straight into its final slot
 ```
 
-No switch, no fallback branch — if an incoming frame's size doesn't match the preallocated buffer, `copy_()` crashes outright instead of silently doing the wrong thing. The accompanying test `test_seek_reader_preallocates_without_stack_and_preserves_order` monkeypatches `torch.stack` to raise if it's ever called, pinning down the fact that stack is no longer invoked.
+If an incoming frame's size doesn't match the preallocated buffer, `copy_()` crashes outright, and `torch.stack` is monkeypatched to raise if it's ever called.
 
 **Use when**: not limited to video decoding — apply this whenever you see a loop that keeps **pushing tensors into a list/dict and then calls `stack`/`cat` once at the end**: know the final size ahead of time → allocate the buffer once → write directly into the right slot inside the loop, eliminating that final redundant full copy.
 

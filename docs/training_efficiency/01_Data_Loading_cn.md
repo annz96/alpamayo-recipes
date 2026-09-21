@@ -42,7 +42,7 @@ if tensors is None:
 tensors[output_slots[cur_frame_idx]].copy_(frame_tensor)  # 直接原地拷进最终位置
 ```
 
-没有开关、没有兜底分支——如果传进来的frame尺寸跟预分配的buffer不匹配,`copy_()`会直接报错崩溃,而不是悄悄地做错事。配套测试 `test_seek_reader_preallocates_without_stack_and_preserves_order` 直接给`torch.stack`打了monkeypatch,一旦被调用就抛异常,把"不再调用stack"这个事实钉死。
+如果传进来的frame尺寸跟预分配的buffer不匹配,`copy_()`会直接报错崩溃, 给`torch.stack`打了monkeypatch,一旦被调用就抛异常。
 
 **适用场景**:不局限于视频解码——任何时候看到一个循环在**不断往列表/字典里塞tensor,最后再统一调一次`stack`/`cat`**,都可以套用这个思路:提前知道最终大小 → 一次性分配好buffer → 循环里直接写进对应位置,省掉最后那次多余的整体拷贝。
 
