@@ -1,3 +1,10 @@
+# 01 Data Loading
+
+> Covers storage → decode → CPU preprocessing → worker CPU scheduling and memory (previously split
+> across three files — storage/decode, CPU preprocessing, CPU scheduling — now merged into one
+> category to match MR !2911's `01_data_loading.md` categorization). Content currently only covers
+> storage/decode; CPU preprocessing and worker scheduling are still to be added.
+
 ## Summary
 1. Preallocate per-frame output memory to fold decode into a single copy
 2. Multi-camera lazy loading (lazy initialization)

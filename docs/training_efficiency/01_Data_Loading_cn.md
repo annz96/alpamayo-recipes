@@ -1,4 +1,5 @@
 ## Summary
+优化项持续更新: 覆盖存储→解码→CPU预处理→worker调度与内存管理的 Dataloader 相关链路。
 1. 预先分配每帧数据内存占用,实现一次解码内存搬运
 2. 多相机按需加载(lazy initialization)
 3. 相机解码线程并发 `camera_decode_max_concurrency`
@@ -7,7 +8,11 @@
 
 ## 1. 预先分配每帧数据内存占用，实现一次解码内存搬运
 
-**思路**:第一帧解码出来时就直接申请好最终的`[N, H, W, 3]`连续buffer,后续每帧解码完直接`.copy_()`写进它在buffer里该在的位置,不再需要"先分散存、最后再stack"这两步。
+**思路**:
+
+![改动前:每帧解码结果先存进列表(4个橙色block),再用torch.stack整体拷贝成输出tensor(4个蓝色block)——峰值内存是两份全量拷贝。改动后:decode直接把每一帧.copy_()写进第一帧解码时就分配好的输出buffer对应槽位,同一时刻只有"一个输出block+一帧在途",没有第二份全量拷贝。](assets/01_preallocate_the_decode_output.png)
+
+第一帧解码出来时就直接申请好最终的`[N, H, W, 3]`连续buffer,后续每帧解码完直接`.copy_()`写进它在buffer里该在的位置,不再需要"先分散存、最后再stack"这两步。
 
 **收益**:独立测:loader吞吐 **+33.9%**,stall负担 **−82.7%**,单样本加载 −20~30%。
 
@@ -43,12 +48,15 @@ tensors[output_slots[cur_frame_idx]].copy_(frame_tensor)  # 直接原地拷进�
 
 ---
 
-## 2. 多相机按需加载（lazy initialization)
+## 2. 多相机按需加载(lazy initialization)
 
-**思路**:每个训练sample来自一个6相机拍摄的driving clip,但一个sample平均只用到约4.1个相机——因为配置里的`camera_subsample_weights`会按权重给每个sample预先抽签,分配到一个"相机子集方案"(比如全部6个/只用前3个等),不是每个sample都用全部6个,这是一种数据增强手段。改动前,clip admission阶段会**提前打开全部6个相机的MP4文件**并建好keyframe索引,不管这个相机后面用不用得到。改动后引入 `DeferredVideoReader`,只记录相机路径(`video_path`字符串),把真正打开文件、构造具体reader(`SeekVideoReader`等)这一步**推迟到第一次真正解码这个相机时才做**——没被选中的相机永远不会被打开。
+**思路**:
+
+![改动前:6个相机在clip admission阶段全部open+index+decode,其中cam5/cam6(橙色)是没被选中的,做的是白工。改动后:6个相机只在第一次真正decode时才open+index,cam1-4(蓝色,被选中)在首次decode时才做这些工作,cam5/cam6(灰色,未选中)永远不会被打开或解码。单节点CPU测:单样本加载 1.640→1.475s(−10.1%);204次容器读取消除90次(−44%)。](assets/01_open_only_the_selected_cameras.png)
+
+每个训练sample来自一个6相机拍摄的driving clip,但一个sample平均只用到约4.1个相机——因为配置里的`camera_subsample_weights`会按权重给每个sample预先抽签,分配到一个"相机子集方案"(比如全部6个/只用前3个等),不是每个sample都用全部6个,这是一种数据增强手段。改动前,clip admission阶段会**提前打开全部6个相机的MP4文件**并建好keyframe索引,不管这个相机后面用不用得到。改动后引入 `DeferredVideoReader`,只记录相机路径(`video_path`字符串),把真正打开文件、构造具体reader(`SeekVideoReader`等)这一步**推迟到第一次真正解码这个相机时才做**——没被选中的相机永远不会被打开。
 
 **收益**:`mean_load_s_per_sample` 1.640→**1.475**(−10.1%);全SFT A/B:全步wall **−5.7%**,severe stalls **−30%**;204次相机payload读取消除90次(**−44%**)。
-
 
 **实现**:数据加载模块的相机reader构造逻辑
 
@@ -103,6 +111,9 @@ admission阶段现在只是把6个 `DeferredVideoReader`(不含文件句柄)塞�
 ## 3. 相机解码线程并发 `camera_decode_max_concurrency`
 
 **思路**:
+
+![改动前(cap=1):worker线程顺序解码cam1-6,6个camera-decode的wall time串成一条线。改动后(cap=2):worker线程解cam1/3/5,复用的helper线程并发解cam2/4/6,总CPU work不变,但wall time砍半——最慢样本的解码时间减半。S2 6-worker场景:severe steps 18.27%→10.00%,mean 1.784→1.530s/step;S1同节点配对:severe负担−33%~−45%,干净路径代价+1.6%。](assets/01_bounded_decode_overlap_for_latency_tails.png)
+
 ```
  serial (cap=1):    cam1 ──── cam2 ──── cam3 ──── cam4 ──── cam5 ──── cam6
                     └──────────────── ~6 × t_cam ─────────────────┘
@@ -119,7 +130,7 @@ worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个wo
 **收益**:分三组场景测试
 - **S1,同node配对A/B**:stall gap(每step因stall多花的时间)**−0.050s/step**;severe负担**−33%~−45%**;副作用检查——即使完全没撞上重样本的"干净路径",代价也只**+1.6%**（落在±2%的节点噪声范围内,基本可以认为无额外开销）
 - **S2,6-worker(worker池小,单点重样本更容易拖垮全局)**:叠加"懒加载+受限解码并发"后,severe steps **18.27%→10.00%**("prefetch4+懒加载+解码并发"三者一起叠加的效果)
-- **⚠️ S2,10-worker(worker池够大 + 瓶颈见02)**:severe steps **16.5%→16.5%,无效**。原因:①池子够大时,一个worker卡住,其余worker能顶上,不再是短板;②S2这里的severe stall根源其实是[02_Dataloader_Preprocessing_cn.md](02_Dataloader_Preprocessing_cn.md)里 allocator/32MB mmap阈值问题,跟"重样本长尾延迟"是两种情况。
+- **S2,10-worker(worker池够大 + 瓶颈见02)**:severe steps **16.5%→16.5%,无效**。原因:①池子够大时,一个worker卡住,其余worker能顶上,不再是短板;②S2这里的severe stall根源其实是[02_Dataloader_Preprocessing_cn.md](02_Dataloader_Preprocessing_cn.md)里 allocator/32MB mmap阈值问题,跟"重样本长尾延迟"是两种情况。
 
 **实现**:多相机解码调度逻辑
 
