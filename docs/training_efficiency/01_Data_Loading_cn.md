@@ -118,15 +118,6 @@ admission阶段现在只是把6个 `DeferredVideoReader`(不含文件句柄)塞�
 
 ![改动前(cap=1):worker线程顺序解码cam1-6,6个camera-decode的wall time串成一条线。改动后(cap=2):worker线程解cam1/3/5,复用的helper线程并发解cam2/4/6,总CPU work不变,但wall time砍半——最慢样本的解码时间减半。S2 6-worker场景:severe steps 18.27%→10.00%,mean 1.784→1.530s/step;S1同节点配对:severe负担−33%~−45%,干净路径代价+1.6%。](assets/01_bounded_decode_overlap_for_latency_tails.png)
 
-```
- serial (cap=1):    cam1 ──── cam2 ──── cam3 ──── cam4 ──── cam5 ──── cam6
-                    └──────────────── ~6 × t_cam ─────────────────┘
-
- pair overlap (=2): cam1 ──── cam3 ──── cam5 ────        (worker thread)
-                    cam2 ──── cam4 ──── cam6 ────        (helper thread)
-                    └──────── ~3 × t_cam ───────┘   latency ÷2, CPU ≈ same
-
-```
 worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个worker进程/node不能各配一个FFmpeg线程池),六相机、4帧的sample要解30-50帧HEVC 1080p,重样本的长尾延迟会拖垮整批——一个worker进程内部按FIFO顺序交付sample,轮到重样本就必须先解完它才能交下一个;而分布式训练要求所有rank都凑齐batch才能开始这一步,只要80个worker里有任意1个卡在重样本上,其余全部rank(哪怕早就准备好了)都得陪着空等,这就是severe stall的触发场景。
 
 改动给每个worker进程配一个**复用的helper线程**(`os.register_at_fork`保证fork安全,进程私有、只建一次、之后反复复用,不是每次现开现销毁):把要解的相机两两分批(`camera_decode_max_concurrency=2`),每一批里,主线程解第1个相机的同时,helper线程并发解第2个,结果严格按输入顺序落地;下一批再依次进行,不是把选中的相机一次性全丢给2个线程。并发上限用schema锁死为2(`Literal[1, 2]`),测过把上限抬到4是倒退(+12%,SMT硬件线程预算被挤爆)。
