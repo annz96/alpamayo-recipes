@@ -28,4 +28,10 @@ TBD — 待后续补充(例如 SFT → VLM RL → Action Expert RL → ...)
 ## 补充：命名
 Stall：一个训练step里,最慢的那个rank(GPU)要等数据等多久。
 - severe stall:某个step里,各个rank准备好数据的时间差 > 2秒——意味着有个rank(数据没准备好)让其它所有rank(GPU)干等超过2秒,这2秒GPU完全在空转,是纯粹的浪费
-- stall负担(stall burden):衡量的是"这种严重卡顿在所有step里占的比例有多高",比如ch5里提到的"9.1%(89/980 steps)"就是这个意思——980个训练step里,有89个step撞上了severe stall
+- stall负担(stall burden):衡量的是"这种严重卡顿在所有step里占的比例有多高",比如"9.1%(89/980 steps)"就是这个意思——980个训练step里,有89个step撞上了severe stall
+
+S1 / S2:Alpamayo训练流程里的两个训练阶段。
+- S1(Stage 1):全量SFT训练,训练整个模型(包括backbone)
+- S2(Stage 2):专家头训练,backbone冻结不动,只训练一个小的expert模块
+
+S1/S2计算量差别很大——S2每步计算量小,CPU侧的固定开销(worker解码、内存分配等)在总step时间里占比更显眼,更容易暴露出数据侧瓶颈;两者的最优worker数/batch size等配置也不一样,所以文档里的优化收益通常要分S1/S2分别报数字。
