@@ -16,7 +16,9 @@ As soon as the first frame is decoded, allocate the final `[N, H, W, 3]` contigu
 
 **Gain**: measured standalone: loader throughput **+33.9%**, stall burden **−82.7%**, per-sample load time −20~30%.
 
-**Implementation**: the video frame decode module (`decode_images_from_frame_indices`)
+**Implementation**:
+- public github [TBD]
+- internal gitlab [`0d53ef73e8`](https://gitlab-master.nvidia.com/alpamayo/alpamayo/-/commit/0d53ef73e8)
 
 Before:
 ```python
@@ -59,7 +61,9 @@ Each training sample comes from a driving clip shot with 6 cameras, but a sample
 
 **Gain**: `mean_load_s_per_sample` 1.640→**1.475** (−10.1%); full-SFT A/B: whole-step wall **−5.7%**, severe stalls **−30%**; 90 of 204 camera payload reads eliminated (**−44%**).
 
-**Implementation**: the camera-reader construction logic in the data loading module
+**Implementation**:
+- public github [TBD]
+- internal gitlab [`43b6c87bbb`](https://gitlab-master.nvidia.com/alpamayo/alpamayo/-/commit/43b6c87bbb)
 
 Before:
 ```python
@@ -134,7 +138,9 @@ The change gives each worker process a **reused helper thread** (`os.register_at
 - **S2, 6-worker (small worker pool, a single heavy sample more easily drags down the whole run)**: stacked with "lazy loading + bounded decode concurrency," severe steps **18.27%→10.00%** (the combined effect of "prefetch4 + lazy init + decode concurrency" together)
 - **S2, 10-worker (large enough worker pool + the bottleneck is elsewhere)**: severe steps **16.5%→16.5%, no effect**. Reason: ① with a large enough pool, when one worker gets stuck the others can pick up the slack, so it's no longer the bottleneck; ② the root cause of severe stalls here in S2 is actually the allocator/32MB mmap-threshold issue (see the CPU-preprocessing techniques below), a different mechanism from "heavy-sample long-tail latency."
 
-**Implementation**: the multi-camera decode scheduling logic
+**Implementation**:
+- public github [TBD]
+- internal gitlab [`!2859`](https://gitlab-master.nvidia.com/alpamayo/alpamayo/-/merge_requests/2859)
 
 Before:
 ```python

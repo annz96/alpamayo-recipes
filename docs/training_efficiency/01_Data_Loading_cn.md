@@ -16,7 +16,9 @@
 
 **收益**:独立测:loader吞吐 **+33.9%**,stall负担 **−82.7%**,单样本加载 −20~30%。
 
-**实现**:视频帧解码模块(`decode_images_from_frame_indices`)
+**实现**:
+- public github [TBD]
+- internal gitlab [`0d53ef73e8`](https://gitlab-master.nvidia.com/alpamayo/alpamayo/-/commit/0d53ef73e8)
 
 改动前:
 ```python
@@ -58,7 +60,9 @@ tensors[output_slots[cur_frame_idx]].copy_(frame_tensor)  # 直接原地拷进�
 
 **收益**:`mean_load_s_per_sample` 1.640→**1.475**(−10.1%);全SFT A/B:全步wall **−5.7%**,severe stalls **−30%**;204次相机payload读取消除90次(**−44%**)。
 
-**实现**:数据加载模块的相机reader构造逻辑
+**实现**:
+- public github [TBD]
+- internal gitlab [`43b6c87bbb`](https://gitlab-master.nvidia.com/alpamayo/alpamayo/-/commit/43b6c87bbb)
 
 改动前:
 ```python
@@ -132,7 +136,9 @@ worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个wo
 - **S2,6-worker(worker池小,单点重样本更容易拖垮全局)**:叠加"懒加载+受限解码并发"后,severe steps **18.27%→10.00%**("prefetch4+懒加载+解码并发"三者一起叠加的效果)
 - **S2,10-worker(worker池够大 + 瓶颈见下文CPU预处理相关技术)**:severe steps **16.5%→16.5%,无效**。原因:①池子够大时,一个worker卡住,其余worker能顶上,不再是短板;②S2这里的severe stall根源其实是 allocator/32MB mmap阈值问题(CPU预处理小节),跟"重样本长尾延迟"是两种情况。
 
-**实现**:多相机解码调度逻辑
+**实现**:
+- public github [TBD]
+- internal gitlab [`!2859`](https://gitlab-master.nvidia.com/alpamayo/alpamayo/-/merge_requests/2859)
 
 改动前:
 ```python
