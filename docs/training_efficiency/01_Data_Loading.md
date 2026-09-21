@@ -136,7 +136,7 @@ The change gives each worker process a **reused helper thread** (`os.register_at
 **Gain**: tested across three scenario groups
 - **S1, same-node paired A/B**: stall gap (extra time per step from stalling) **−0.050s/step**; severe burden **−33%~−45%**; side-effect check — even on the "clean path" that never hits a heavy sample, the cost is only **+1.6%** (within the ±2% node-noise range, essentially no added overhead)
 - **S2, 6-worker (small worker pool, a single heavy sample more easily drags down the whole run)**: stacked with "lazy loading + bounded decode concurrency," severe steps **18.27%→10.00%** (the combined effect of "prefetch4 + lazy init + decode concurrency" together)
-- **S2, 10-worker (large enough worker pool + the bottleneck is elsewhere)**: severe steps **16.5%→16.5%, no effect**. Reason: ① with a large enough pool, when one worker gets stuck the others can pick up the slack, so it's no longer the bottleneck; ② the root cause of severe stalls here in S2 is actually the allocator/32MB mmap-threshold issue (see the CPU-preprocessing techniques below), a different mechanism from "heavy-sample long-tail latency."
+- **S2, 10-worker (large enough worker pool + the bottleneck is elsewhere)**: severe steps 16.5%→16.5%, no meaningful gain. Reason: ① with a large enough pool, when one worker gets stuck the others can pick up the slack, so it's no longer the bottleneck; ② the root cause of severe stalls here in S2 is actually the allocator/32MB mmap-threshold issue (see the CPU-preprocessing techniques below), a different mechanism from "heavy-sample long-tail latency."
 
 **Implementation**:
 - public github [TBD]
