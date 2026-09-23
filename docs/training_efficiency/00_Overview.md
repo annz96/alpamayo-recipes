@@ -1,24 +1,3 @@
-## Current Optimization Results
-
-Covers 2B / 8B / 32B model sizes and both training stages (S1: full SFT, S2: frozen-backbone expert training), measured at each configuration's production topology (8-64 nodes): **up to ~50% fewer GPU-hours**.
-
-![Training cost, final optimization stack vs baseline. Stage 1 (full SFT) and Stage 2 (expert) each compare 2B/8B/32B model sizes at the production batch (green) and the doubled alternate batch b8/b2 (purple) in GPU-hours; the hatched portion is the cost the optimizations removed, and each bar is labelled with its percentage reduction and 100k-step end-to-end wall time.](assets/combined_cost_frontier.png)
-
-| Model · stage | Per-GPU batch | Topology | Before (s/step) | After (s/step) | GPU-hours change | 100k-step wall time |
-| --- | --- | --- | ---: | ---: | ---: | --- |
-| 2B S1 | b4 | FSDP8 × 16 GPUs | 2.324 | **1.315** | **−43%** | 2.69d → 1.52d |
-| 2B S2 | b4 | dp_shard1 × 128 GPUs | 2.402 | **0.737** | **−69%** | 2.78d → 0.85d |
-| 8B S1 | b4 | FSDP8 × 16 GPUs | 4.645 | **3.082** | **−34%** | 5.38d → 3.57d |
-| 8B S2 | b4 | FSDP8 × 16 GPUs | 2.523 | **1.029** | **−59%** | 2.92d → 1.19d |
-| 32B S1 | b1 | FSDP16 × 32 GPUs | 3.908 | **3.265** | **−58%** | 4.52d → 3.78d |
-| 32B S2 | b4 | FSDP8 × 16 GPUs | 3.320 | **2.431** | **−63%** | 3.84d → 2.81d |
-
-> wall (s)/step is true wall-clock time (not the trainer log's iteration time).
->
-> 100k-E2E GPU-hours are normalized to global batch 512 over 100k steps.
->
-> The purple b8/b2 alternate batches in the chart: they halve the GPU count and double the per-GPU batch, keeping the same global batch of 512, so the 100k-step end-to-end wall time is actually longer (2B S1 b8: 2.6 days, 8B S1 b8: 6.2 days, 32B S1 b2: 6.2 days) — but they finish on fewer GPUs and at a lower per-sample cost (2B −13.2%, 8B −10.5%, 32B S1 −14.6%). It's a "fewer GPUs, longer wall time, lower total cost" alternative.
-
 ## Optimization Categories
 
 ```
