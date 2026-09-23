@@ -1,3 +1,3 @@
-# 04 并行与显存
+# 04 Parallelism & Memory
 
 敬请期待!

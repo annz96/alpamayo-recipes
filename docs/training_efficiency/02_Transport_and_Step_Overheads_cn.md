@@ -1,3 +1,3 @@
-# 02 传输与 Step 收尾开销
+# 02 Transport & Step Overhead
 
 敬请期待!
