@@ -14,7 +14,7 @@ Techniques added continuously: covers the dataloader-related chain from storage 
 
 As soon as the first frame is decoded, allocate the final `[N, H, W, 3]` contiguous buffer right away; every subsequent decoded frame is `.copy_()`'d directly into its slot in that buffer, eliminating the "scatter first, stack at the end" two-step.
 
-**Reference gain (internal benchmark)**: measured standalone: loader throughput **+33.9%**, stall burden **−82.7%**, per-sample load time −20~30%.
+**Gain**: (internal benchmark, for reference) measured standalone: loader throughput **+33.9%**, stall burden **−82.7%**, per-sample load time −20~30%.
 
 **Implementation**:
 - public github [TBD]
@@ -59,7 +59,7 @@ If an incoming frame's size doesn't match the preallocated buffer, `copy_()` cra
 
 Each training sample comes from a driving clip shot with 6 cameras, but a sample uses only about 4.1 cameras on average — the `camera_subsample_weights` config draws each sample a weighted "camera subset plan" ahead of time (e.g. all 6 / only the first 3), so not every sample uses all 6; this is a form of data augmentation. Before the change, the clip-admission stage would **eagerly open all 6 cameras' MP4 files** and build their keyframe indexes, regardless of whether a given camera would end up being used. After the change, a `DeferredVideoReader` is introduced that only records the camera's path (the `video_path` string); actually opening the file and constructing the concrete reader (`SeekVideoReader`, etc.) is **deferred until the first time that camera is actually decoded** — an unselected camera is never opened.
 
-**Reference gain (internal benchmark)**: `mean_load_s_per_sample` 1.640→**1.475** (−10.1%); full-SFT A/B: whole-step wall **−5.7%**, severe stalls **−30%**; 90 of 204 camera payload reads eliminated (**−44%**).
+**Gain**: (internal benchmark, for reference) `mean_load_s_per_sample` 1.640→**1.475** (−10.1%); full-SFT A/B: whole-step wall **−5.7%**, severe stalls **−30%**; 90 of 204 camera payload reads eliminated (**−44%**).
 
 **Implementation**:
 - public github [TBD]
@@ -124,7 +124,7 @@ The worker decoder is strictly single-threaded and serial (`video_decode_thread_
 
 The change gives each worker process a **reused helper thread** (`os.register_at_fork` guarantees fork-safety; it's process-private, built once, and reused repeatedly rather than being torn down and recreated each time): the cameras to decode are split into pairs (`camera_decode_max_concurrency=2`); within each pair, the main thread decodes the first camera while the helper thread concurrently decodes the second, with results landing strictly in input order; the next pair then proceeds the same way — it's not that all the selected cameras get thrown at 2 threads at once. The concurrency cap is locked to 2 by the schema (`Literal[1, 2]`); raising the cap to 4 was tested and found to be a regression (+12%, the SMT hardware-thread budget gets overrun).
 
-**Reference gain (internal benchmark)**: tested across three scenario groups
+**Gain**: (internal benchmark, for reference) tested across three scenario groups
 - **S1, same-node paired A/B**: stall gap (extra time per step from stalling) **−0.050s/step**; severe burden **−33%~−45%**; side-effect check — even on the "clean path" that never hits a heavy sample, the cost is only **+1.6%** (within the ±2% node-noise range, essentially no added overhead)
 - **S2, 6-worker (small worker pool, a single heavy sample more easily drags down the whole run)**: stacked with "lazy loading + bounded decode concurrency," severe steps **18.27%→10.00%** (the combined effect of "prefetch4 + lazy init + decode concurrency" together)
 - **S2, 10-worker (large enough worker pool + the bottleneck is elsewhere)**: severe steps 16.5%→16.5%, no meaningful gain. Reason: ① with a large enough pool, when one worker gets stuck the others can pick up the slack, so it's no longer the bottleneck; ② the root cause of severe stalls here in S2 is actually the allocator/32MB mmap-threshold issue (see the CPU-preprocessing techniques below), a different mechanism from "heavy-sample long-tail latency."
