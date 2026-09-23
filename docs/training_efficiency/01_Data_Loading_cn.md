@@ -54,7 +54,7 @@ tensors[output_slots[cur_frame_idx]].copy_(frame_tensor)  # 直接原地拷进�
 
 ![改动前:6个相机在clip admission阶段全部open+index+decode,其中cam5/cam6(橙色)是没被选中的,做的是白工。改动后:6个相机只在第一次真正decode时才open+index,cam1-4(蓝色,被选中)在首次decode时才做这些工作,cam5/cam6(灰色,未选中)永远不会被打开或解码。单节点CPU测:单样本加载 1.640→1.475s(−10.1%);204次容器读取消除90次(−44%)。](assets/01_open_only_the_selected_cameras.png)
 
-每个训练sample来自一个6相机拍摄的driving clip,但一个sample平均只用到约4.1个相机——因为配置里的`camera_subsample_weights`会按权重给每个sample预先抽签,分配到一个"相机子集方案"(比如全部6个/只用前3个等),不是每个sample都用全部6个,这是一种数据增强手段。改动前,clip admission阶段会**提前打开全部6个相机的MP4文件**并建好keyframe索引,不管这个相机后面用不用得到。改动后引入 `DeferredVideoReader`,只记录相机路径(`video_path`字符串),把真正打开文件、构造具体reader(`SeekVideoReader`等)这一步**推迟到第一次真正解码这个相机时才做**——没被选中的相机永远不会被打开。
+这项优化适用于任何"每个sample只按需加载配置里声明的相机/传感器子集,而不是全部都用"的数据集——比如通过`camera_subsample_weights`这类策略,给每个sample按权重预先抽签分配一个"相机子集方案"(全部6个/只用前3个等),这是一种数据增强手段。举例来说,当平均每个sample只加载6个配置相机里的约4.1个时,改动前clip admission阶段会**提前打开全部6个相机的MP4文件**并建好keyframe索引,不管这个相机后面用不用得到。改动后引入 `DeferredVideoReader`,只记录相机路径(`video_path`字符串),把真正打开文件、构造具体reader(`SeekVideoReader`等)这一步**推迟到第一次真正解码这个相机时才做**——没被选中的相机永远不会被打开。
 
 **收益**:(内部benchmark供参考) `mean_load_s_per_sample` 1.640→**1.475**(−10.1%);全SFT A/B:全步wall **−5.7%**,severe stalls **−30%**;204次相机payload读取消除90次(**−44%**)。
 
