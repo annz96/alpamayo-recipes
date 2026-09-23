@@ -14,7 +14,7 @@
 
 第一帧解码出来时就直接申请好最终的`[N, H, W, 3]`连续buffer,后续每帧解码完直接`.copy_()`写进它在buffer里该在的位置,不再需要"先分散存、最后再stack"这两步。
 
-**收益**:独立测:loader吞吐 **+33.9%**,stall负担 **−82.7%**,单样本加载 −20~30%。
+**参考收益(内部benchmark)**:独立测:loader吞吐 **+33.9%**,stall负担 **−82.7%**,单样本加载 −20~30%。
 
 **实现**:
 - public github [TBD]
@@ -58,7 +58,7 @@ tensors[output_slots[cur_frame_idx]].copy_(frame_tensor)  # 直接原地拷进�
 
 每个训练sample来自一个6相机拍摄的driving clip,但一个sample平均只用到约4.1个相机——因为配置里的`camera_subsample_weights`会按权重给每个sample预先抽签,分配到一个"相机子集方案"(比如全部6个/只用前3个等),不是每个sample都用全部6个,这是一种数据增强手段。改动前,clip admission阶段会**提前打开全部6个相机的MP4文件**并建好keyframe索引,不管这个相机后面用不用得到。改动后引入 `DeferredVideoReader`,只记录相机路径(`video_path`字符串),把真正打开文件、构造具体reader(`SeekVideoReader`等)这一步**推迟到第一次真正解码这个相机时才做**——没被选中的相机永远不会被打开。
 
-**收益**:`mean_load_s_per_sample` 1.640→**1.475**(−10.1%);全SFT A/B:全步wall **−5.7%**,severe stalls **−30%**;204次相机payload读取消除90次(**−44%**)。
+**参考收益(内部benchmark)**:`mean_load_s_per_sample` 1.640→**1.475**(−10.1%);全SFT A/B:全步wall **−5.7%**,severe stalls **−30%**;204次相机payload读取消除90次(**−44%**)。
 
 **实现**:
 - public github [TBD]
@@ -122,7 +122,7 @@ worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个wo
 
 改动给每个worker进程配一个**复用的helper线程**(`os.register_at_fork`保证fork安全,进程私有、只建一次、之后反复复用,不是每次现开现销毁):把要解的相机两两分批(`camera_decode_max_concurrency=2`),每一批里,主线程解第1个相机的同时,helper线程并发解第2个,结果严格按输入顺序落地;下一批再依次进行,不是把选中的相机一次性全丢给2个线程。并发上限用schema锁死为2(`Literal[1, 2]`),测过把上限抬到4是倒退(+12%,SMT硬件线程预算被挤爆)。
 
-**收益**:分三组场景测试
+**参考收益(内部benchmark)**:分三组场景测试
 - **S1,同node配对A/B**:stall gap(每step因stall多花的时间)**−0.050s/step**;severe负担**−33%~−45%**;副作用检查——即使完全没撞上重样本的"干净路径",代价也只**+1.6%**（落在±2%的节点噪声范围内,基本可以认为无额外开销）
 - **S2,6-worker(worker池小,单点重样本更容易拖垮全局)**:叠加"懒加载+受限解码并发"后,severe steps **18.27%→10.00%**("prefetch4+懒加载+解码并发"三者一起叠加的效果)
 - **S2,10-worker(worker池够大 + 瓶颈见下文CPU预处理相关技术)**:severe steps 16.5%→16.5%,无明显收益。原因:①池子够大时,一个worker卡住,其余worker能顶上,不再是短板;②S2这里的severe stall根源其实是 allocator/32MB mmap阈值问题(CPU预处理小节),跟"重样本长尾延迟"是两种情况。
