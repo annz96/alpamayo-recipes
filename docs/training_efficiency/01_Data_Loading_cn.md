@@ -114,7 +114,7 @@ admission阶段现在只是把6个 `DeferredVideoReader`(不含文件句柄)塞�
 
 ![改动前(cap=1):worker线程顺序解码cam1-6,6个camera-decode的wall time串成一条线。改动后(cap=2):worker线程解cam1/3/5,复用的helper线程并发解cam2/4/6,总CPU work不变,但wall time砍半——最慢样本的解码时间减半。S2 6-worker场景:severe steps 18.27%→10.00%,mean 1.784→1.530s/step;S1同节点配对:severe负担−33%~−45%,干净路径代价+1.6%。](assets/01_bounded_decode_overlap_for_latency_tails.png)
 
-worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个worker进程/node不能各配一个FFmpeg线程池)。六相机、4帧的sample名义上只需要24个目标帧(6×4),但实际要解**30-50帧**HEVC 1080p——原因是视频按GOP(group of pictures)压缩,解码器要取到某个时间戳的目标帧,必须从它所属GOP最近的关键帧开始顺序解码到目标帧(不能直接跳过去),所以每个目标帧背后通常要"搭"解码好几个非目标帧;"重样本"(heavy sample)指的就是目标帧离关键帧较远、或分散在更多GOP里,导致实际解码帧数明显高于其他样本的那类样本——它的长尾延迟会拖垮整批:一个worker进程内部按FIFO顺序交付sample,轮到重样本就必须先解完它才能交下一个;而分布式训练要求所有rank都凑齐batch才能开始这一步,只要80个worker里有任意1个卡在重样本上,其余全部rank(哪怕早就准备好了)都得陪着空等,这就是severe stall的触发场景。
+worker解码器严格单线程串行(`video_decode_thread_count=1`,因为80个worker进程/node不能各配一个FFmpeg线程池)。六相机、4帧的sample实际要解**30-50帧**HEVC 1080p(视频按GOP压缩,解码到目标帧前要先顺序解码完GOP内前面的帧,所以帧数比"6×4"更多),帧数明显偏多的**"重样本"**一旦卡住,长尾延迟会拖垮整批——一个worker进程内部按FIFO顺序交付sample,轮到重样本就必须先解完它才能交下一个;而分布式训练要求所有rank都凑齐batch才能开始这一步,只要80个worker里有任意1个卡在重样本上,其余全部rank(哪怕早就准备好了)都得陪着空等,这就是severe stall的触发场景。
 
 改动给每个worker进程配一个**复用的helper线程**(`os.register_at_fork`保证fork安全,进程私有、只建一次、之后反复复用,不是每次现开现销毁):把要解的相机两两分批(`camera_decode_max_concurrency=2`),每一批里,主线程解第1个相机的同时,helper线程并发解第2个,结果严格按输入顺序落地;下一批再依次进行,不是把选中的相机一次性全丢给2个线程。并发上限用schema锁死为2(`Literal[1, 2]`),测过把上限抬到4是倒退(+12%,SMT硬件线程预算被挤爆)。
 
