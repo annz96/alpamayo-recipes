@@ -334,6 +334,11 @@ The idea is to save the scene at the moment the guard fires (the offending batch
 
 **Implementation**:
 
+When a NaN / inf gradient appears, the saved scene consists of:
+- the still-clean weights and optimizer shards (in the production checkpoint layout, written by one dp_replicate group, since the other replicas hold identical content);
+- the real batch that triggered the training step (saved by the rank that owns it);
+- a per-rank record: finiteness maps of the gradients and weights on the local shard, per-loss values, the recent gradient-norm history, a random-state snapshot and run metadata.
+
 After the gradient-norm guard of every training step, the trainer calls `observe`. Its `non_finite` input is the result the guard already has to synchronize to the CPU, so forensics reuses it and adds no GPU→CPU synchronization:
 
 ```python
@@ -389,6 +394,8 @@ class NaNForensics:
             barrier_fn()                            # wait for all ranks to finish saving
         raise NaNPersistenceError(msg)
 ```
+
+After an event, an offline replay tool reproduces and localizes the problem: it merges the shards, rebuilds the training graph, re-collates the captured batch the way the trainer does, runs one forward + backward under anomaly detection, and reports the first module that outputs a non-finite value; running it once per attention backend shows whether the problem is a kernel problem or a data problem. The gradients have already been reduced across ranks before the guard, so any rank's batch can trigger the NaN; replay every rank that owns a batch, one by one, until it reproduces.
 
 **Experiment data**: (internal data, for reference)
 

@@ -334,6 +334,11 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 
 **实现**:
 
+出现 NaN / inf 梯度时，保存的现场包括：
+- 仍然干净的权重和 optimizer 分片（采用生产 checkpoint 布局，由一个 dp_replicate 组写出，其余副本的内容相同）；
+- 触发该训练 step 的真实 batch（由拥有它的 rank 保存）；
+- 逐 rank 的记录：本地分片上梯度和权重的有限性图、分项 loss 值、近期梯度范数历史、随机状态快照和 run 元数据。
+
 trainer 在每个训练 step 的梯度范数 guard 之后调用 `observe`，其中 `non_finite` 是 guard 本来就要同步到 CPU 的结果，取证直接复用，不新增 GPU→CPU 同步：
 
 ```python
@@ -390,13 +395,15 @@ class NaNForensics:
         raise NaNPersistenceError(msg)
 ```
 
+出事之后，用离线 replay 工具复现和定位：合并分片、重建训练图，按 trainer 的方式重新 collate 被捕获的 batch，在 anomaly detection 下跑一次 forward + backward，报告第一个输出非有限值的模块；切换 attention 后端各跑一次，可以判断是 kernel 问题还是数据问题。梯度在 guard 之前已经在各 rank 之间 reduce，任何一个 rank 的 batch 都可能触发 NaN，所以要对每个拥有 batch 的 rank 逐个 replay，直到复现。
+
 **实验数据**:(内部数据供参考)
 
 下表为取证机制的验证，包括健康路径上的开销、出事时的保存耗时，以及保存下来的现场是否可用：
 
 | 验证项 | 检查 | 结果 |
 |---|---|---|
-| 额外开销验证 | 是否对健康训练 step 的 `iteration time`有影响，取证开 vs 关 | 均值 3.1301 s vs 3.1302 s（0.00%）；中位数相差 < 0.03% |
+| 额外开销验证 | 是否对健康训练 step 的 `iteration time` 有影响，取证开 vs 关 | 均值 3.1301 s vs 3.1302 s（0.00%）；中位数相差 < 0.03% |
 | 额外开销验证 | 是否对健康训练 step，开 compile bundle 时的开 / 关 | 均值 −0.02%，在 run 抖动之内 |
 | 额外开销验证 | 出现 NaN/Inf 问题时保存耗时 | 32B 模型，8 节点：端到端 33~44 s |
 | 证据可用性验证 | replay 的 forward 保真度 | replay 的 loss 与记录值逐位一致 |
