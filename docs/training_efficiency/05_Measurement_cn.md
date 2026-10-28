@@ -393,9 +393,7 @@ class NaNForensics:
         raise NaNPersistenceError(msg)
 ```
 
-捕捉问题之后，可用离线 replay 工具复现和定位：合并分片、重建训练图，按 trainer 的方式重新 collate 被捕获的 batch，在 anomaly detection 下跑一次 forward + backward，报告第一个输出非有限值的模块；切换 attention 后端各跑一次，可以判断是 kernel 问题还是数据问题。梯度在 guard 之前已经在各 rank 之间 reduce，任何一个 rank 的 batch 都可能触发 NaN，所以要对每个拥有 batch 的 rank 逐个 replay，直到复现。
-
-下面是 replay 的示意代码（省略了加载保存的权重、重建 batch 的部分，它们与具体模型和数据打包方式有关）：
+捕捉到问题之后，用离线 replay 工具复现和定位：加载保存的权重和 batch，在 anomaly detection 下跑一次 forward + backward，报告第一个输出非有限值的模块；切换 attention 后端各跑一次，可以判断是 kernel 问题还是数据问题。梯度在 guard 之前已经在各 rank 之间 reduce，任何一个 rank 的 batch 都可能触发 NaN，所以要对每个拥有 batch 的 rank 逐个 replay，直到复现。下面是示意代码（省略了加载权重和重建 batch 的部分，它们与具体模型和数据打包方式有关）：
 
 ```python
 import torch

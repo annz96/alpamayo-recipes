@@ -395,9 +395,7 @@ class NaNForensics:
         raise NaNPersistenceError(msg)
 ```
 
-After an event, an offline replay tool reproduces and localizes the problem: it merges the shards, rebuilds the training graph, re-collates the captured batch the way the trainer does, runs one forward + backward under anomaly detection, and reports the first module that outputs a non-finite value; running it once per attention backend shows whether the problem is a kernel problem or a data problem. The gradients have already been reduced across ranks before the guard, so any rank's batch can trigger the NaN; replay every rank that owns a batch, one by one, until it reproduces.
-
-Illustrative replay code (the part that loads the saved weights and rebuilds the batch is omitted, since it depends on the model and the data packing):
+After an event, an offline replay tool reproduces and localizes the problem: it loads the saved weights and batch, runs one forward + backward under anomaly detection, and reports the first module that outputs a non-finite value; running it once per attention backend shows whether the problem is a kernel problem or a data problem. The gradients have already been reduced across ranks before the guard, so any rank's batch can trigger the NaN; replay every rank that owns a batch, one by one, until it reproduces. The illustrative code below omits the part that loads the weights and rebuilds the batch, since it depends on the model and the data packing:
 
 ```python
 import torch
