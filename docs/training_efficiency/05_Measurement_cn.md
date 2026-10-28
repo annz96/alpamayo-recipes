@@ -334,12 +334,10 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 
 **实现**:
 
-出现 NaN / inf 梯度时，保存的现场包括：
+trainer 在每个训练 step 的梯度范数 guard 之后调用 `observe`，其中 `non_finite` 是 guard 本来就要同步到 CPU 的结果，取证直接复用，不新增 GPU→CPU 同步。出现 NaN / inf 梯度时，保存的现场包括：
 - 仍然干净的权重和 optimizer 分片（采用生产 checkpoint 布局，由一个 dp_replicate 组写出，其余副本的内容相同）；
 - 触发该训练 step 的真实 batch（由拥有它的 rank 保存）；
 - 逐 rank 的记录：本地分片上梯度和权重的有限性图、分项 loss 值、近期梯度范数历史、随机状态快照和 run 元数据。
-
-trainer 在每个训练 step 的梯度范数 guard 之后调用 `observe`，其中 `non_finite` 是 guard 本来就要同步到 CPU 的结果，取证直接复用，不新增 GPU→CPU 同步：
 
 ```python
 class NaNForensics:
@@ -395,7 +393,52 @@ class NaNForensics:
         raise NaNPersistenceError(msg)
 ```
 
-出事之后，用离线 replay 工具复现和定位：合并分片、重建训练图，按 trainer 的方式重新 collate 被捕获的 batch，在 anomaly detection 下跑一次 forward + backward，报告第一个输出非有限值的模块；切换 attention 后端各跑一次，可以判断是 kernel 问题还是数据问题。梯度在 guard 之前已经在各 rank 之间 reduce，任何一个 rank 的 batch 都可能触发 NaN，所以要对每个拥有 batch 的 rank 逐个 replay，直到复现。
+捕捉问题之后，可用离线 replay 工具复现和定位：合并分片、重建训练图，按 trainer 的方式重新 collate 被捕获的 batch，在 anomaly detection 下跑一次 forward + backward，报告第一个输出非有限值的模块；切换 attention 后端各跑一次，可以判断是 kernel 问题还是数据问题。梯度在 guard 之前已经在各 rank 之间 reduce，任何一个 rank 的 batch 都可能触发 NaN，所以要对每个拥有 batch 的 rank 逐个 replay，直到复现。
+
+下面是 replay 的示意代码（省略了加载保存的权重、重建 batch 的部分，它们与具体模型和数据打包方式有关）：
+
+```python
+import torch
+from contextlib import nullcontext
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+_BACKENDS = {"math": SDPBackend.MATH, "cudnn": SDPBackend.CUDNN_ATTENTION}
+
+def has_nonfinite(x):
+    if torch.is_tensor(x):
+        return not torch.isfinite(x).all().item()
+    if isinstance(x, (list, tuple)):
+        return any(has_nonfinite(v) for v in x)
+    if isinstance(x, dict):
+        return any(has_nonfinite(v) for v in x.values())
+    return False
+
+def replay(model, batch, sdpa="auto"):
+    # model、batch：用保存的权重和 batch 重建（与具体模型和数据打包方式有关，这里省略）
+    first = []                                               # 第一个输出非有限值的模块
+    def make_hook(name):
+        def hook(module, args, output):
+            if not first and has_nonfinite(output):
+                first.append(name)
+        return hook
+    hooks = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules()]
+
+    ctx = sdpa_kernel([_BACKENDS[sdpa]]) if sdpa != "auto" else nullcontext()
+    model.zero_grad(set_to_none=True)
+    anomaly = None
+    try:
+        with ctx, torch.autograd.detect_anomaly():           # 要同时包住 forward 和 backward
+            model(**batch)["loss"].backward()
+    except RuntimeError as e:                                # detect_anomaly 会指出产生 NaN 的 backward 算子
+        anomaly = str(e)[:2000]
+    for h in hooks:
+        h.remove()
+    return {"first_nonfinite_module": first[0] if first else None, "backward_anomaly": anomaly}
+
+# 换 attention 后端各跑一次：只有 cudnn 出 NaN、math 不出，说明与 kernel 相关
+for backend in ("cudnn", "math"):
+    print(backend, replay(model, batch, sdpa=backend))
+```
 
 **实验数据**:(内部数据供参考)
 

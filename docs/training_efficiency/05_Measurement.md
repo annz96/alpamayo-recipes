@@ -397,6 +397,51 @@ class NaNForensics:
 
 After an event, an offline replay tool reproduces and localizes the problem: it merges the shards, rebuilds the training graph, re-collates the captured batch the way the trainer does, runs one forward + backward under anomaly detection, and reports the first module that outputs a non-finite value; running it once per attention backend shows whether the problem is a kernel problem or a data problem. The gradients have already been reduced across ranks before the guard, so any rank's batch can trigger the NaN; replay every rank that owns a batch, one by one, until it reproduces.
 
+Illustrative replay code (the part that loads the saved weights and rebuilds the batch is omitted, since it depends on the model and the data packing):
+
+```python
+import torch
+from contextlib import nullcontext
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+_BACKENDS = {"math": SDPBackend.MATH, "cudnn": SDPBackend.CUDNN_ATTENTION}
+
+def has_nonfinite(x):
+    if torch.is_tensor(x):
+        return not torch.isfinite(x).all().item()
+    if isinstance(x, (list, tuple)):
+        return any(has_nonfinite(v) for v in x)
+    if isinstance(x, dict):
+        return any(has_nonfinite(v) for v in x.values())
+    return False
+
+def replay(model, batch, sdpa="auto"):
+    # model, batch: rebuilt from the saved weights and batch (depends on the model and the data packing, omitted here)
+    first = []                                               # the first module that outputs a non-finite value
+    def make_hook(name):
+        def hook(module, args, output):
+            if not first and has_nonfinite(output):
+                first.append(name)
+        return hook
+    hooks = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules()]
+
+    ctx = sdpa_kernel([_BACKENDS[sdpa]]) if sdpa != "auto" else nullcontext()
+    model.zero_grad(set_to_none=True)
+    anomaly = None
+    try:
+        with ctx, torch.autograd.detect_anomaly():           # must wrap both the forward and the backward
+            model(**batch)["loss"].backward()
+    except RuntimeError as e:                                # detect_anomaly names the backward op that produced the NaN
+        anomaly = str(e)[:2000]
+    for h in hooks:
+        h.remove()
+    return {"first_nonfinite_module": first[0] if first else None, "backward_anomaly": anomaly}
+
+# run once per attention backend: NaN with cudnn but not with math means it depends on the kernel
+for backend in ("cudnn", "math"):
+    print(backend, replay(model, batch, sdpa=backend))
+```
+
 **Experiment data**: (internal data, for reference)
 
 The table below validates the forensics mechanism: the overhead on the healthy path, the time to save when an event occurs, and whether the saved scene is usable:
