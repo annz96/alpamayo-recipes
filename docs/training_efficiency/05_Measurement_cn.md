@@ -1,15 +1,17 @@
 ## Summary
 训练效率的核心指标是训练 step（一次训练迭代，即一次 optimizer 更新）的 GPU-hour 消耗；trainer 日志里的 `iteration time` 只是量其中一段的计时器（见第 2 项）。排查效率问题时，很容易被表面指标误导，如设备GPU利用率很高但实际吞吐低。本章介绍训练效率的测量与评估方法，分三部分：效率指标（怎么量准）、监控方法（怎么持续发现异常）、问题定位（按症状找到瓶颈点），各条后面的编号对应正文的小节。
 
+正文各项按使用顺序排列：第 1~3 项讲怎么量、怎么拆（逐 rank 遥测、`wall clock`、CUDA event 分解），先找出时间花在哪里；第 4~5 项讲怎么算成本和利用率（`GPU-hour`、`MFU / HFU / OFU`）；第 6~10 项是持续监控与辅助方法。
+
 **效率指标**:
 - `severe stall`: 一个 rank 拖住全体的训练 step 占比(各 rank 到达时间差 > 2 s),衡量数据等待造成的浪费 (见第 1 项)
 - `wall clock`: 从日志时间戳算完整的 s/step (见第 2 项)
-- `GPU-hour`: 用 `wall clock` 均值算,不用中位数 (见第 3 项)
-- `MFU / HFU / OFU`: 看实际算力利用,不看设备利用率 (见第 4 项)
+- `GPU-hour`: 用 `wall clock` 均值算,不用中位数 (见第 4 项)
+- `MFU / HFU / OFU`: 看实际算力利用,不看设备利用率 (见第 5 项)
 
 **监控方法**:训练中的持续记录与回归监控,以及单独测量某一段的方法（第 6~10 项持续补充中）
 - 逐 rank 遥测与 `severe stall`: 记录每个 rank 的等待与计算,定位拖慢整体的 rank (见第 1 项)
-- CUDA event 分解: 把训练 step 拆成 `arrival` / `forward` / `backward` / `host residual` (见第 5 项)
+- CUDA event 分解: 把训练 step 拆成 `arrival` / `forward` / `backward` / `host residual` (见第 3 项)
 - 回归带: 定期跑固定配方,给 loss、训练 step 时间、MFU、显存设范围,超出就报警 (见第 6 项)
 - 取证: 出现非有限梯度时保存现场,不在健康训练 step 上加 collective (见第 7 项)
 - benchmark harness: 跳过 optimizer,单独量 loader 与启动时间 (见第 8 项)
@@ -20,11 +22,11 @@
 
 | 症状 | 表现 | 看哪些指标 |
 |---|---|---|
-| 训练 step 慢于硬件预期，原因不明 | 设备利用率（`sm%`）高、loss 正常，但每个训练 step 的 `wall clock` 比硬件预期长 | 真实 `wall clock / step`;`arrival`、`forward`、`backward`、`host residual` (详见第 2、5 项;细到模块和算子见第 10 项) |
+| 训练 step 慢于硬件预期，原因不明 | 设备利用率（`sm%`）高、loss 正常，但每个训练 step 的 `wall clock` 比硬件预期长 | 真实 `wall clock / step`;`arrival`、`forward`、`backward`、`host residual` (详见第 2、3 项;细到模块和算子见第 10 项) |
 | 单个 rank 拖慢所有 rank | 各训练 step 的 `wall clock` 均值远高于中位数；周期性出现多秒的训练 step，此时有的 rank 在等 batch，有的 rank 已在等梯度同步 | `arrival`(即 data wait)、`severe stall`、`stall gap`、`clean step` (详见第 1 项;单独量 loader 见第 8 项) |
-| 每个训练 step 都有固定的额外开销 | 各训练 step 的 `wall clock` 均值与中位数接近（没有长尾），但都高于对照配置：每个训练 step 都稳定地多花一段时间 | `forward`、`backward`、`host residual` (详见第 5 项;细到算子见第 10 项) |
-| GPU 利用率接近 100%，但吞吐偏低 | 设备利用率（`sm%`）接近 100%，但 `OFU` 很低、功耗接近空闲 | `MFU`、`HFU`、`OFU`、`HFU / OFU`、功耗;不看设备利用率(`sm%`) (详见第 4 项) |
-| 汇报的数字与实际 GPU-hour 账单不一致 | 日志里的 `iteration time` 低于真实 `wall clock`；或用中位数估算的成本，低于实际 `GPU-hour` 账单 | 真实 `wall clock / step`、`GPU-hour`(用均值),对照 `iteration time` (详见第 2、3 项) |
+| 每个训练 step 都有固定的额外开销 | 各训练 step 的 `wall clock` 均值与中位数接近（没有长尾），但都高于对照配置：每个训练 step 都稳定地多花一段时间 | `forward`、`backward`、`host residual` (详见第 3 项;细到算子见第 10 项) |
+| GPU 利用率接近 100%，但吞吐偏低 | 设备利用率（`sm%`）接近 100%，但 `OFU` 很低、功耗接近空闲 | `MFU`、`HFU`、`OFU`、`HFU / OFU`、功耗;不看设备利用率(`sm%`) (详见第 5 项) |
+| 汇报的数字与实际 GPU-hour 账单不一致 | 日志里的 `iteration time` 低于真实 `wall clock`；或用中位数估算的成本，低于实际 `GPU-hour` 账单 | 真实 `wall clock / step`、`GPU-hour`(用均值),对照 `iteration time` (详见第 2、4 项) |
 
 ---
 
@@ -45,7 +47,7 @@ stall 指标取“差值”而不是绝对值：若一个 rank 等待 11 s 而�
 
 **实现**:
 
-每条记录包含：该 rank 等待 batch 的时间（`arrival`），从收到 batch 到训练 step 结束的时间（含 H2D 拷贝、forward、backward、梯度同步，记为 `arrival-else`，代码中的字段为 `fwd_bwd_time_s`），forward 与 backward 的 GPU event 计时（见第 5 项），样本数与 token 数，以及设备显存。rank 0 汇总各 rank 的记录后，以一行 JSON-lines 追加写入文件。
+每条记录包含：该 rank 等待 batch 的时间（`arrival`），从收到 batch 到训练 step 结束的时间（含 H2D 拷贝、forward、backward、梯度同步，记为 `arrival-else`，代码中的字段为 `fwd_bwd_time_s`），forward 与 backward 的 GPU event 计时（见第 3 项），样本数与 token 数，以及设备显存。rank 0 汇总各 rank 的记录后，以一行 JSON-lines 追加写入文件。
 
 分析方式如下：
 
@@ -63,13 +65,12 @@ sev  = sum(1 for r in sel
 
 **实验数据**:(内部数据供参考)
 
-实验设置：2B 模型，16 节点 / 128 GPU，1,000 步 benchmark；口径为逐 rank 遥测的 `instrument wall`（step 21~1,000），severe 采用“到达时间差 > 2 s”的定义。下表是同一模型、同样数据下的三种 stage 2 配置（配置由模型规模、训练阶段、并行 topology、per-GPU batch 和 loader 变体决定；各 loader 变体见 01 章），仅依据逐 rank 遥测的指标，即可判断各自属于哪一类问题：
+实验设置：2B 模型，16 节点 / 128 GPU，1,000 步 benchmark；口径为逐 rank 遥测的 `instrument wall`（step 21~1,000），severe 采用“到达时间差 > 2 s”的定义。下表是同一模型、同样数据下的两种配置，仅依据逐 rank 遥测的指标，即可判断各自属于哪一类问题瓶颈：
 
 | 配置 | `instrument wall` 均值 (s) | `instrument wall` 中位数 (s) | `severe stall` 比例 | `arrival` p95 (s) | 判断 |
 |---|---:|---:|---:|---:|---|
-| loader 变体 A：整样本预处理，打包后丢弃原始图像帧 | 2.138 | 1.104 | 18.0% | 6.78 | 均值远高于中位数，`severe stall` 比例高：长尾延迟问题，应优化 loader 的供给稳定性 |
-| loader 变体 B：逐帧流式预处理 | 1.576 | 1.556 | 0.0% | 0.29 | 均值接近中位数，无 stall：loader 供给稳定，应进一步排查 compute 等开销（见第 5 项 CUDA event 分解） |
-| 对照基线：loader 优化全部关闭，eager（不使用 `torch.compile`） | 2.472 | 1.524 | 15.3% | 7.03 | 与变体 A 相同：长尾延迟问题（eager 下 stall 特征不变） |
+| 配置 A | 2.138 | 1.104 | 18.0% | 6.78 | 均值远高于中位数，`severe stall` 比例高：长尾延迟问题，应优化 loader 的供给稳定性 |
+| 配置 B | 1.576 | 1.556 | 0.0% | 0.29 | 均值接近中位数，无 stall：loader 供给稳定，应进一步排查 compute 等开销（见第 3 项 CUDA event 分解） |
 
 说明：
 - 本章的表格采用 `severe stall` 的定义（各 rank 到达时间差 > 2 s）。其他资料中也可能采用 `absolute stall` 的定义（最慢 rank 的等待 > 5 s），使用时应注明所采用的是哪一种。
@@ -142,7 +143,58 @@ step_time = tot_s / tot_n                                   # 秒数之和 / 步
 
 ---
 
-## 3. `GPU-hour`: 用 `wall clock` 均值算,不用中位数
+## 3. CUDA event 分解: 把训练 step 拆成 `arrival` / `forward` / `backward` / `host residual`
+
+**思路**:
+
+![同一刻度（秒）上的三条训练 step 时间线：仅有遥测时，较慢配置是一整块 1.449 s 的 arrival-else；CUDA event 将其拆成 forward 0.835、backward 0.478、host residual 0.110 s，对比正常配置的 0.553、0.321、0.090 s；橙色标记跨过 forward 的 +0.28 s 差异，标注为 CPU 线程资源不足造成的 launch 间隙，而 host residual 基本不变。](assets/05_cuda_event_decomposition_of_the_step.png)
+
+第 1 项的遥测把训练 step 拆成“等待（`arrival`）”和 `arrival-else` 两块。当 `arrival-else` 本身变长时，需要进一步判断时间花在哪里：forward 计算、backward 加梯度 all-reduce，还是两者之间的 host 工作。
+
+做法：启用逐 rank 遥测后，trainer 用 CUDA event（`torch.cuda.Event(enable_timing=True)`，由 GPU 在自己的 stream 上打的时间戳）包住 forward 和 backward。两个 event 之间的时间**包含 GPU 等待 CPU 提交下一个 kernel 的间隙**，即 event 区间 = kernel 时间 + launch 间隙。
+
+于是在决定训练 step 时长的那个 rank 上，一个训练 step 分为四段：`arrival`（loader 遥测）、`forward` 和 `backward`（event）、`host residual`（ `arrival-else` − forward − backward，即数据搬运、optimizer 的 host 侧开销、阶段之间的 Python 代码）。读法：`host residual` 变长，说明阶段之间的 host 代码变慢；`forward` 或 `backward` 变长而 kernel 和数据都没有变，则只可能是 launch 间隙，即向 GPU 提交 kernel 的 CPU 线程受到了干扰。
+
+**实现**:
+
+数据来自第 1 项的逐 rank 记录，一次查询即可（示意）：
+
+```python
+# 每步取 fwd_bwd_time_s 最大的 rank，读它的 forward / backward，计算 residual
+for r in rows[20:1000]:
+    x = max(r["ranks"], key=lambda e: e["fwd_bwd_time_s"])
+    residual = x["fwd_bwd_time_s"] - x["forward_time_s"] - x["backward_time_s"]
+# 报告各段的中位数
+```
+
+event 在 forward 前后、`loss.backward()` 前后各放一对。实现时需遵守以下规则：
+- **event 区间同时包含 kernel 时间和 launch 间隙**：因此 “forward 变慢” 不等于 “模型变慢”。应先固定 kernel（输入逐位相同、编译相同），此时任何差值都是 launch 间隙。
+- **backward 会吸收同步等待**：一个 rank 在阻塞的梯度 collective 中等待被卡住的同伴，会把这段等待记为 backward 时间（例如某个使用 4 个 worker 的配置，`backward` 中位数为 0.920 s，而正常配置为 0.398 s）。应只对 `arrival` 曲线正常的配置做分解。
+- **event 的开销可忽略，但只有逐 rank 遥测打开时才存在**：需要在 benchmark 时就开启；没有开启时，可改用 profiler trace（第 10 项）这一更重的离线方案。
+
+**实验数据**:(内部数据供参考)
+
+实验背景：在优化 data loader 的过程中，发现除 `arrival`（等待 batch）之外，`arrival-else` 变长了（配置 B 中，每个训练 step 的 `arrival-else` 明显增加），需要用 CUDA event 进一步判断是哪一段变长。
+
+实验目的：通过拆解判断瓶颈在哪一段，从而确定优化方向。
+
+实验设置：2B 模型 stage 2，16 节点，1,000 步 benchmark；各段取决定训练 step 时长的那个 rank 上的中位数（逐 rank 遥测，step 21~1,000），单位为秒。两种配置与第 1 项相同：
+
+| 配置 | `arrival-else` | `forward` | `backward` | `host residual` |
+|---|---:|---:|---:|---:|
+| 配置 A | 1.017 | 0.553 | 0.321 | 0.090 |
+| 配置 B | 1.449 | 0.835 | 0.478 | 0.110 |
+
+说明：
+- 表中各段取的是中位数，所以几段之和不一定等于 `arrival-else`（例如第一行 1.017 − 0.553 − 0.321 ≠ 0.090）。
+- 配置 B 的 `arrival-else` 比配置 A 多出约 0.43 s，而 `host residual` 只变化约 0.02 s，说明增加的开销几乎都落在 GPU 计时的区间内。其中 `forward` 增加约 **0.28 s**（0.553 → 0.835），而两者的 batch 逐位相同、编译的 kernel 也相同，推断差别是 forward launch 间隙问题：trainer 的 CPU 线程得不到足够的 CPU 资源。
+- 数据加载侧的 CPU 分区修复印证了这一判断：在 10 个 worker 的配置下，为 trainer 划分专用物理核后，`forward` 中位数由 0.766 s 降至 0.589 s。
+
+**适用场景**：第 1 项的逐 rank 遥测显示 `arrival` 正常（没有明显的等待数据问题），而训练 step 仍然偏慢、`arrival-else` 偏长时，用 CUDA event 把 `arrival-else` 拆成 `forward`、`backward` 和 `host residual`，定位瓶颈在哪一段，再决定优化方向。在对训练 step 时间回归提出假设之前，应先做分解，再提出假设。
+
+---
+
+## 4. `GPU-hour`: 用 `wall clock` 均值算,不用中位数
 
 **思路**:
 
@@ -175,7 +227,7 @@ e2e_days_per_100k  = mean_wall_s_per_step * 100_000 / 86_400
 
 ---
 
-## 4. `MFU / HFU / OFU`: 看实际算力利用,不看设备利用率
+## 5. `MFU / HFU / OFU`: 看实际算力利用,不看设备利用率
 
 **思路**:
 
@@ -223,57 +275,6 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 |---|---:|---:|---:|
 | keep-alive 开（默认） | 88% / 100% | 132 W | 1.600 |
 | keep-alive 关（对照） | 16% / 0% | 135 W | 1.593 |
-
----
-
-## 5. CUDA event 分解: 把训练 step 拆成 `arrival` / `forward` / `backward` / `host residual`
-
-**思路**:
-
-![同一刻度（秒）上的三条训练 step 时间线：仅有遥测时，较慢配置是一整块 1.449 s 的 arrival-else；CUDA event 将其拆成 forward 0.835、backward 0.478、host residual 0.110 s，对比正常配置的 0.553、0.321、0.090 s；橙色标记跨过 forward 的 +0.28 s 差异，标注为 CPU 线程资源不足造成的 launch 间隙，而 host residual 基本不变。](assets/05_cuda_event_decomposition_of_the_step.png)
-
-第 1 项的遥测把训练 step 拆成“等待（`arrival`）”和 `arrival-else` 两块。当 `arrival-else` 本身变长时，需要进一步判断时间花在哪里：forward 计算、backward 加梯度 all-reduce，还是两者之间的 host 工作。
-
-做法：启用逐 rank 遥测后，trainer 用 CUDA event（`torch.cuda.Event(enable_timing=True)`，由 GPU 在自己的 stream 上打的时间戳）包住 forward 和 backward。两个 event 之间的时间**包含 GPU 等待 CPU 提交下一个 kernel 的间隙**，即 event 区间 = kernel 时间 + launch 间隙。
-
-于是在决定训练 step 时长的那个 rank 上，一个训练 step 分为四段：`arrival`（loader 遥测）、`forward` 和 `backward`（event）、`host residual`（ `arrival-else` − forward − backward，即数据搬运、optimizer 的 host 侧开销、阶段之间的 Python 代码）。读法：`host residual` 变长，说明阶段之间的 host 代码变慢；`forward` 或 `backward` 变长而 kernel 和数据都没有变，则只可能是 launch 间隙，即向 GPU 提交 kernel 的 CPU 线程受到了干扰。
-
-**实现**:
-
-数据来自第 1 项的逐 rank 记录，一次查询即可（示意）：
-
-```python
-# 每步取 fwd_bwd_time_s 最大的 rank，读它的 forward / backward，计算 residual
-for r in rows[20:1000]:
-    x = max(r["ranks"], key=lambda e: e["fwd_bwd_time_s"])
-    residual = x["fwd_bwd_time_s"] - x["forward_time_s"] - x["backward_time_s"]
-# 报告各段的中位数
-```
-
-event 在 forward 前后、`loss.backward()` 前后各放一对。实现时需遵守以下规则：
-- **event 区间同时包含 kernel 时间和 launch 间隙**：因此 “forward 变慢” 不等于 “模型变慢”。应先固定 kernel（输入逐位相同、编译相同），此时任何差值都是 launch 间隙。
-- **backward 会吸收同步等待**：一个 rank 在阻塞的梯度 collective 中等待被卡住的同伴，会把这段等待记为 backward 时间（例如某个使用 4 个 worker 的配置，`backward` 中位数为 0.920 s，而正常配置为 0.398 s）。应只对 `arrival` 曲线正常的配置做分解。
-- **event 的开销可忽略，但只有逐 rank 遥测打开时才存在**：需要在 benchmark 时就开启；没有开启时，可改用 profiler trace（第 10 项）这一更重的离线方案。
-
-**实验数据**:(内部数据供参考)
-
-实验背景：在优化 data loader 的过程中，发现除 `arrival`（等待 batch）之外，`arrival-else` 变长了（采用逐帧流式预处理的配置里，每个训练 step 的 `arrival-else` 明显增加），需要用 CUDA event 进一步判断是哪一段变长。
-
-实验目的：通过拆解判断瓶颈在哪一段，从而确定优化方向。
-
-实验设置：2B 模型 stage 2，16 节点，1,000 步 benchmark；各段取决定训练 step 时长的那个 rank 上的中位数（逐 rank 遥测，step 21~1,000），单位为秒。两种 loader 变体与第 1 节相同：
-
-| 配置 | `arrival-else` | `forward` | `backward` | `host residual` |
-|---|---:|---:|---:|---:|
-| loader 变体 A：整样本预处理，打包后丢弃原始图像帧 | 1.017 | 0.553 | 0.321 | 0.090 |
-| loader 变体 B：逐帧流式预处理 | 1.449 | 0.835 | 0.478 | 0.110 |
-
-说明：
-- 表中各段取的是中位数，所以几段之和不一定等于 `arrival-else`（例如第一行 1.017 − 0.553 − 0.321 ≠ 0.090）。
-- 变体 B 的 `arrival-else` 比变体 A 多出约 0.43 s，而 `host residual` 只变化约 0.02 s，说明增加的开销几乎都落在 GPU 计时的区间内。其中 `forward` 增加约 **0.28 s**（0.553 → 0.835），而两者的 batch 逐位相同、编译的 kernel 也相同，推断差别是 forward launch 间隙问题：trainer 的 CPU 线程得不到足够的 CPU 资源。
-- 数据加载侧的 CPU 分区修复印证了这一判断：在 10 个 worker 的配置下，为 trainer 划分专用物理核后，`forward` 中位数由 0.766 s 降至 0.589 s。
-
-**适用场景**：第 1 项的逐 rank 遥测显示 `arrival` 正常（没有明显的等待数据问题），而训练 step 仍然偏慢、`arrival-else` 偏长时，用 CUDA event 把 `arrival-else` 拆成 `forward`、`backward` 和 `host residual`，定位瓶颈在哪一段，再决定优化方向。在对训练 step 时间回归提出假设之前，应先做分解，再提出假设。
 
 ---
 

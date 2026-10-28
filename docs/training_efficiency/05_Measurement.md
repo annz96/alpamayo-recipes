@@ -1,15 +1,17 @@
 ## Summary
 The core efficiency metric is the GPU-hour cost of a training step (one training iteration, i.e. one optimizer update); the `iteration time` in the trainer log is only a timer covering one part of that step (see item 2). When chasing efficiency problems it is easy to be misled by surface metrics, for example high device GPU utilization with low actual throughput. This chapter covers how to measure and evaluate training efficiency in three parts: efficiency metrics (how to measure accurately), monitoring methods (how to keep detecting anomalies), and problem localization (how to find the bottleneck from a symptom). The item numbers below refer to the sections that follow.
 
+The items follow the order in which they are used: items 1–3 cover how to measure and decompose a training step (per-rank telemetry, `wall clock`, CUDA event decomposition) to find where the time goes; items 4–5 cover how to compute cost and utilization (`GPU-hour`, `MFU / HFU / OFU`); items 6–10 are continuous monitoring and supporting methods.
+
 **Efficiency metrics**:
 - `severe stall`: the share of training steps in which one rank holds up all the others (arrival-time spread across ranks > 2 s); measures the waste caused by waiting for data (see item 1)
 - `wall clock`: compute the complete s/step from log timestamps (see item 2)
-- `GPU-hour`: compute it from the mean `wall clock`, never the median (see item 3)
-- `MFU / HFU / OFU`: look at actual compute utilization, not device utilization (see item 4)
+- `GPU-hour`: compute it from the mean `wall clock`, never the median (see item 4)
+- `MFU / HFU / OFU`: look at actual compute utilization, not device utilization (see item 5)
 
 **Monitoring methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
 - Per-rank telemetry and `severe stall`: record each rank's wait and compute to find the rank that slows everyone down (see item 1)
-- CUDA event decomposition: split a training step into `arrival` / `forward` / `backward` / `host residual` (see item 5)
+- CUDA event decomposition: split a training step into `arrival` / `forward` / `backward` / `host residual` (see item 3)
 - Regression bands: periodically run a fixed recipe and set ranges for loss, training-step time, MFU and memory; alert when they are exceeded (see item 6)
 - Forensics: save the scene when a non-finite gradient appears, and never add a collective to a healthy training step (see item 7)
 - Benchmark harness: skip the optimizer and measure the loader and startup time on their own (see item 8)
@@ -20,11 +22,11 @@ The core efficiency metric is the GPU-hour cost of a training step (one training
 
 | Symptom | What it looks like | Metrics to look at |
 |---|---|---|
-| Training step slower than the hardware suggests, cause unknown | High device utilization (`sm%`) and normal loss, but the `wall clock` of each training step is longer than the hardware suggests | True `wall clock` / step; `arrival`, `forward`, `backward`, `host residual` (items 2 and 5; down to modules and operators in item 10) |
+| Training step slower than the hardware suggests, cause unknown | High device utilization (`sm%`) and normal loss, but the `wall clock` of each training step is longer than the hardware suggests | True `wall clock` / step; `arrival`, `forward`, `backward`, `host residual` (items 2 and 3; down to modules and operators in item 10) |
 | One rank slows down all ranks | The mean `wall clock` per training step is far above its median; periodic multi-second training steps, where some ranks are waiting for the batch while others are already waiting for gradient synchronization | `arrival` (i.e. data wait), `severe stall`, `stall gap`, `clean step` (item 1; measure the loader alone in item 8) |
-| A fixed extra cost in every training step | The mean `wall clock` per training step is close to its median (no long tail), but both are above the reference configuration: every training step reliably costs a fixed extra amount | `forward`, `backward`, `host residual` (item 5; down to operators in item 10) |
-| GPU utilization near 100% but throughput low | Device utilization (`sm%`) near 100%, but `OFU` is low and power draw is close to idle | `MFU`, `HFU`, `OFU`, `HFU / OFU`, power; not device utilization (`sm%`) (item 4) |
-| Reported numbers disagree with the actual GPU-hour bill | The logged `iteration time` is below the true `wall clock`; or a cost estimated from the median is below the actual `GPU-hour` bill | True `wall clock` / step, `GPU-hour` (from the mean), compared against `iteration time` (items 2 and 3) |
+| A fixed extra cost in every training step | The mean `wall clock` per training step is close to its median (no long tail), but both are above the reference configuration: every training step reliably costs a fixed extra amount | `forward`, `backward`, `host residual` (item 3; down to operators in item 10) |
+| GPU utilization near 100% but throughput low | Device utilization (`sm%`) near 100%, but `OFU` is low and power draw is close to idle | `MFU`, `HFU`, `OFU`, `HFU / OFU`, power; not device utilization (`sm%`) (item 5) |
+| Reported numbers disagree with the actual GPU-hour bill | The logged `iteration time` is below the true `wall clock`; or a cost estimated from the median is below the actual `GPU-hour` bill | True `wall clock` / step, `GPU-hour` (from the mean), compared against `iteration time` (items 2 and 4) |
 
 ---
 
@@ -45,7 +47,7 @@ The stall metric uses a difference rather than an absolute value: if one rank wa
 
 **Implementation**:
 
-Each record contains: the time this rank waited for its batch (`arrival`); the time from receiving the batch to the end of the training step (including H2D copy, forward, backward and gradient synchronization, called `arrival-else`, stored in the field `fwd_bwd_time_s`); GPU-event timings of forward and backward (see item 5); sample and token counts; and device memory. Rank 0 gathers the records from all ranks and appends them to a file as one JSON-lines row per step.
+Each record contains: the time this rank waited for its batch (`arrival`); the time from receiving the batch to the end of the training step (including H2D copy, forward, backward and gradient synchronization, called `arrival-else`, stored in the field `fwd_bwd_time_s`); GPU-event timings of forward and backward (see item 3); sample and token counts; and device memory. Rank 0 gathers the records from all ranks and appends them to a file as one JSON-lines row per step.
 
 The analysis looks like this:
 
@@ -63,13 +65,12 @@ sev  = sum(1 for r in sel
 
 **Experiment data**: (internal data, for reference)
 
-Setup: 2B model, 16 nodes / 128 GPUs, 1,000-step benchmark; the metric is the `instrument wall` from per-rank telemetry (steps 21~1,000), and severe uses the "arrival spread > 2 s" definition. The table shows three stage 2 configurations of the same model on the same data (a configuration is determined by model size, training stage, parallel topology, per-GPU batch and loader variant; the loader variants are described in chapter 01). Per-rank telemetry alone is enough to tell which kind of problem each one has:
+Setup: 2B model, 16 nodes / 128 GPUs, 1,000-step benchmark; the metric is the `instrument wall` from per-rank telemetry (steps 21~1,000), and severe uses the "arrival spread > 2 s" definition. The table shows two stage 2 configurations of the same model on the same data. Per-rank telemetry alone is enough to tell which kind of problem each one has:
 
 | Configuration | `instrument wall` mean (s) | `instrument wall` median (s) | `severe stall` ratio | `arrival` p95 (s) | Verdict |
 |---|---:|---:|---:|---:|---|
-| Loader variant A: whole-sample preprocessing, raw image frames dropped after packing | 2.138 | 1.104 | 18.0% | 6.78 | Mean far above median and a high `severe stall` ratio: a long-tail latency problem; improve the loader's supply stability |
-| Loader variant B: per-frame streaming preprocessing | 1.576 | 1.556 | 0.0% | 0.29 | Mean close to median, no stalls: loader supply is stable; investigate compute and other overheads next (item 5, CUDA event decomposition) |
-| Reference baseline: all loader optimizations off, eager (no `torch.compile`) | 2.472 | 1.524 | 15.3% | 7.03 | Same as variant A: a long-tail latency problem (the stall signature is unchanged under eager) |
+| Configuration A | 2.138 | 1.104 | 18.0% | 6.78 | Mean far above median and a high `severe stall` ratio: a long-tail latency problem; improve the loader's supply stability |
+| Configuration B | 1.576 | 1.556 | 0.0% | 0.29 | Mean close to median, no stalls: loader supply is stable; investigate compute and other overheads next (item 3, CUDA event decomposition) |
 
 Notes:
 - Tables in this chapter use the `severe stall` definition (arrival spread across ranks > 2 s). Other material may use an `absolute stall` definition (slowest rank's wait > 5 s); state which one is used.
@@ -142,7 +143,58 @@ Two definitions on the same run (2B model, stage 1, 16 nodes, 100k-step referenc
 
 ---
 
-## 3. `GPU-hour`: compute it from the mean `wall clock`, never the median
+## 3. CUDA event decomposition: split a training step into `arrival` / `forward` / `backward` / `host residual`
+
+**Idea**:
+
+![Three training-step timelines on the same scale (seconds): with telemetry alone, the slower configuration is one 1.449 s block of arrival-else; CUDA events split it into forward 0.835, backward 0.478 and host residual 0.110 s, versus 0.553, 0.321 and 0.090 s for the normal configuration. An orange marker spans the +0.28 s difference in forward, attributed to launch gaps caused by insufficient CPU thread resources, while host residual is essentially unchanged.](assets/05_cuda_event_decomposition_of_the_step.png)
+
+The telemetry of item 1 splits a training step into the wait (`arrival`) and `arrival-else`. When `arrival-else` itself gets longer, the next question is where the time goes: forward compute, backward plus gradient all-reduce, or the host work in between.
+
+Approach: with per-rank telemetry enabled, the trainer wraps forward and backward with CUDA events (`torch.cuda.Event(enable_timing=True)`, timestamps taken by the GPU on its own stream). The time between two events **includes the gaps where the GPU waits for the CPU to submit the next kernel**, i.e. event interval = kernel time + launch gaps.
+
+On the rank that determines the step duration, a training step then splits into four segments: `arrival` (loader telemetry), `forward` and `backward` (events), and `host residual` (`arrival-else` − forward − backward, i.e. data movement, the optimizer's host-side cost, and the Python code between stages). How to read it: a longer `host residual` means the host code between stages got slower; a longer `forward` or `backward` while kernels and data have not changed can only be launch gaps, i.e. the CPU thread that submits kernels to the GPU is being interfered with.
+
+**Implementation**:
+
+The data comes from the per-rank records of item 1, and one query is enough (illustrative):
+
+```python
+# For each step take the rank with the largest fwd_bwd_time_s, read its forward / backward, compute the residual
+for r in rows[20:1000]:
+    x = max(r["ranks"], key=lambda e: e["fwd_bwd_time_s"])
+    residual = x["fwd_bwd_time_s"] - x["forward_time_s"] - x["backward_time_s"]
+# report the median of each segment
+```
+
+Place one pair of events around forward and one pair around `loss.backward()`. Follow these rules when implementing it:
+- **An event interval contains both kernel time and launch gaps**: so "forward got slower" does not mean "the model got slower". Fix the kernels first (bit-identical inputs, same compilation); any remaining difference is then a launch gap.
+- **Backward absorbs synchronization waits**: a rank waiting in a blocking gradient collective for a stuck peer records that wait as backward time (for example, in a configuration with 4 workers the `backward` median was 0.920 s versus 0.398 s in the normal configuration). Only decompose configurations whose `arrival` curve is normal.
+- **The event overhead is negligible, but it exists only when per-rank telemetry is on**: it must be enabled at benchmark time; when it is not, the heavier offline alternative is a profiler trace (item 10).
+
+**Experiment data**: (internal data, for reference)
+
+Background: while optimizing the data loader, we found that besides `arrival` (waiting for the batch), `arrival-else` also got longer (in configuration B, `arrival-else` per training step increased markedly), and CUDA events were needed to find out which segment grew.
+
+Purpose: find which segment holds the bottleneck from the decomposition, and thereby decide the optimization direction.
+
+Setup: 2B model, stage 2, 16 nodes, 1,000-step benchmark; each segment is the median on the rank that determines the step duration (per-rank telemetry, steps 21~1,000), in seconds. The two configurations are the same as in item 1:
+
+| Configuration | `arrival-else` | `forward` | `backward` | `host residual` |
+|---|---:|---:|---:|---:|
+| Configuration A | 1.017 | 0.553 | 0.321 | 0.090 |
+| Configuration B | 1.449 | 0.835 | 0.478 | 0.110 |
+
+Notes:
+- Each segment in the table is a median, so the segments do not necessarily add up to `arrival-else` (for example in the first row 1.017 − 0.553 − 0.321 ≠ 0.090).
+- Configuration B's `arrival-else` is about 0.43 s longer than configuration A's, while `host residual` changes by only about 0.02 s, so almost all the added cost falls inside the GPU-timed intervals. `forward` grows by about **0.28 s** (0.553 → 0.835) even though the batches are bit-identical and the compiled kernels are the same; our inference is a forward launch-gap problem: the trainer's CPU thread is not getting enough CPU resources.
+- A CPU-partitioning fix on the data-loading side supports this: in a 10-worker configuration, giving the trainer dedicated physical cores lowered the `forward` median from 0.766 s to 0.589 s. The two preprocessing recipes differ, so this is not a strict controlled comparison.
+
+**When to use**: when the per-rank telemetry of item 1 shows a normal `arrival` (no obvious data-wait problem) but the training step is still slow and `arrival-else` is long, use CUDA events to split `arrival-else` into `forward`, `backward` and `host residual`, locate the segment that holds the bottleneck, and then decide the optimization direction. Before forming a hypothesis about a training-step-time regression, decompose first and hypothesize afterwards.
+
+---
+
+## 4. `GPU-hour`: compute it from the mean `wall clock`, never the median
 
 **Idea**:
 
@@ -175,7 +227,7 @@ Setup: for a 2B model, `GPU-hour` and end-to-end time per 100k steps computed by
 
 ---
 
-## 4. `MFU / HFU / OFU`: look at actual compute utilization, not device utilization
+## 5. `MFU / HFU / OFU`: look at actual compute utilization, not device utilization
 
 **Idea**:
 
@@ -223,57 +275,6 @@ Validation (2B model, 1 node × 8 GPUs): with keep-alive on, the warm-up utiliza
 |---|---:|---:|---:|
 | keep-alive on (default) | 88% / 100% | 132 W | 1.600 |
 | keep-alive off (reference) | 16% / 0% | 135 W | 1.593 |
-
----
-
-## 5. CUDA event decomposition: split a training step into `arrival` / `forward` / `backward` / `host residual`
-
-**Idea**:
-
-![Three training-step timelines on the same scale (seconds): with telemetry alone, the slower configuration is one 1.449 s block of arrival-else; CUDA events split it into forward 0.835, backward 0.478 and host residual 0.110 s, versus 0.553, 0.321 and 0.090 s for the normal configuration. An orange marker spans the +0.28 s difference in forward, attributed to launch gaps caused by insufficient CPU thread resources, while host residual is essentially unchanged.](assets/05_cuda_event_decomposition_of_the_step.png)
-
-The telemetry of item 1 splits a training step into the wait (`arrival`) and `arrival-else`. When `arrival-else` itself gets longer, the next question is where the time goes: forward compute, backward plus gradient all-reduce, or the host work in between.
-
-Approach: with per-rank telemetry enabled, the trainer wraps forward and backward with CUDA events (`torch.cuda.Event(enable_timing=True)`, timestamps taken by the GPU on its own stream). The time between two events **includes the gaps where the GPU waits for the CPU to submit the next kernel**, i.e. event interval = kernel time + launch gaps.
-
-On the rank that determines the step duration, a training step then splits into four segments: `arrival` (loader telemetry), `forward` and `backward` (events), and `host residual` (`arrival-else` − forward − backward, i.e. data movement, the optimizer's host-side cost, and the Python code between stages). How to read it: a longer `host residual` means the host code between stages got slower; a longer `forward` or `backward` while kernels and data have not changed can only be launch gaps, i.e. the CPU thread that submits kernels to the GPU is being interfered with.
-
-**Implementation**:
-
-The data comes from the per-rank records of item 1, and one query is enough (illustrative):
-
-```python
-# For each step take the rank with the largest fwd_bwd_time_s, read its forward / backward, compute the residual
-for r in rows[20:1000]:
-    x = max(r["ranks"], key=lambda e: e["fwd_bwd_time_s"])
-    residual = x["fwd_bwd_time_s"] - x["forward_time_s"] - x["backward_time_s"]
-# report the median of each segment
-```
-
-Place one pair of events around forward and one pair around `loss.backward()`. Follow these rules when implementing it:
-- **An event interval contains both kernel time and launch gaps**: so "forward got slower" does not mean "the model got slower". Fix the kernels first (bit-identical inputs, same compilation); any remaining difference is then a launch gap.
-- **Backward absorbs synchronization waits**: a rank waiting in a blocking gradient collective for a stuck peer records that wait as backward time (for example, in a configuration with 4 workers the `backward` median was 0.920 s versus 0.398 s in the normal configuration). Only decompose configurations whose `arrival` curve is normal.
-- **The event overhead is negligible, but it exists only when per-rank telemetry is on**: it must be enabled at benchmark time; when it is not, the heavier offline alternative is a profiler trace (item 10).
-
-**Experiment data**: (internal data, for reference)
-
-Background: while optimizing the data loader, we found that besides `arrival` (waiting for the batch), `arrival-else` also got longer (in the configuration using per-frame streaming preprocessing, `arrival-else` per training step increased markedly), and CUDA events were needed to find out which segment grew.
-
-Purpose: find which segment holds the bottleneck from the decomposition, and thereby decide the optimization direction.
-
-Setup: 2B model, stage 2, 16 nodes, 1,000-step benchmark; each segment is the median on the rank that determines the step duration (per-rank telemetry, steps 21~1,000), in seconds. The two loader variants are the same as in item 1:
-
-| Configuration | `arrival-else` | `forward` | `backward` | `host residual` |
-|---|---:|---:|---:|---:|
-| Loader variant A: whole-sample preprocessing, raw image frames dropped after packing | 1.017 | 0.553 | 0.321 | 0.090 |
-| Loader variant B: per-frame streaming preprocessing | 1.449 | 0.835 | 0.478 | 0.110 |
-
-Notes:
-- Each segment in the table is a median, so the segments do not necessarily add up to `arrival-else` (for example in the first row 1.017 − 0.553 − 0.321 ≠ 0.090).
-- Variant B's `arrival-else` is about 0.43 s longer than variant A's, while `host residual` changes by only about 0.02 s, so almost all the added cost falls inside the GPU-timed intervals. `forward` grows by about **0.28 s** (0.553 → 0.835) even though the batches are bit-identical and the compiled kernels are the same; our inference is a forward launch-gap problem: the trainer's CPU thread is not getting enough CPU resources.
-- A CPU-partitioning fix on the data-loading side supports this: in a 10-worker configuration, giving the trainer dedicated physical cores lowered the `forward` median from 0.766 s to 0.589 s. The two preprocessing recipes differ, so this is not a strict controlled comparison.
-
-**When to use**: when the per-rank telemetry of item 1 shows a normal `arrival` (no obvious data-wait problem) but the training step is still slow and `arrival-else` is long, use CUDA events to split `arrival-else` into `forward`, `backward` and `host residual`, locate the segment that holds the bottleneck, and then decide the optimization direction. Before forming a hypothesis about a training-step-time regression, decompose first and hypothesize afterwards.
 
 ---
 
