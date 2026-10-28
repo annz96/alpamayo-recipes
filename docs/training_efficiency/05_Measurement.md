@@ -1,17 +1,16 @@
 ## Summary
-The core efficiency metric is the GPU-hour cost of a training step (one training iteration, i.e. one optimizer update); the `iteration time` in the trainer log is only a timer covering one part of that step (see item 2). When chasing efficiency problems it is easy to be misled by surface metrics, for example high device GPU utilization with low actual throughput. This chapter covers how to measure and evaluate training efficiency in three parts: efficiency metrics (how to measure accurately), monitoring methods (how to keep detecting anomalies), and problem localization (how to find the bottleneck from a symptom). The item numbers below refer to the sections that follow.
+The core efficiency metric is the GPU-hour cost of a training step (one training iteration, i.e. one optimizer update); the `iteration time` in the trainer log is only a timer covering one part of that step (see item 2). When chasing efficiency problems it is easy to be misled by surface metrics, for example high device GPU utilization with low actual throughput. This chapter covers how to measure and evaluate training efficiency, in the order the methods are used: how to measure and decompose a step (find out where the time goes first), how to compute cost and utilization, and continuous monitoring and supporting methods; it ends with a problem-localization table (find the bottleneck from a symptom). The item numbers below refer to the sections that follow.
 
-The items follow the order in which they are used: items 1–3 cover how to measure and decompose a training step (per-rank telemetry, `wall clock`, CUDA event decomposition) to find where the time goes; items 4–5 cover how to compute cost and utilization (`GPU-hour`, `MFU / HFU / OFU`); items 6–10 are continuous monitoring and supporting methods.
-
-**Efficiency metrics**:
-- `severe stall`: the share of training steps in which one rank holds up all the others (arrival-time spread across ranks > 2 s); measures the waste caused by waiting for data (see item 1)
+**How to measure and decompose**: find out where the time goes first (items 1–3)
+- Per-rank telemetry and `severe stall`: record each rank's wait and compute to find the rank that slows everyone down (see item 1)
 - `wall clock`: compute the complete s/step from log timestamps (see item 2)
+- CUDA event decomposition: split a training step into `arrival` / `forward` / `backward` / `host residual` (see item 3)
+
+**How to compute cost and utilization**: cost from the true `wall clock`, utilization from actual compute (items 4–5)
 - `GPU-hour`: compute it from the mean `wall clock`, never the median (see item 4)
 - `MFU / HFU / OFU`: look at actual compute utilization, not device utilization (see item 5)
 
-**Monitoring methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
-- Per-rank telemetry and `severe stall`: record each rank's wait and compute to find the rank that slows everyone down (see item 1)
-- CUDA event decomposition: split a training step into `arrival` / `forward` / `backward` / `host residual` (see item 3)
+**Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
 - Regression bands: periodically run a fixed recipe and set ranges for loss, training-step time, MFU and memory; alert when they are exceeded (see item 6)
 - Forensics: save the scene when a non-finite gradient appears, and never add a collective to a healthy training step (see item 7)
 - Benchmark harness: skip the optimizer and measure the loader and startup time on their own (see item 8)
