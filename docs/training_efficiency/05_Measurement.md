@@ -11,7 +11,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 - `MFU / HFU / OFU`: look at actual compute utilization, not device utilization (see item 5)
 
 **Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
-- Regression bands: periodically run a fixed recipe and set ranges for loss, training-step time, MFU and memory; alert when they are exceeded (see item 6)
+- Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
 - Forensics: save the scene when a non-finite gradient appears, and never add a collective to a healthy training step (see item 7)
 - Benchmark harness: skip the optimizer and measure the loader and startup time on their own (see item 8)
 - Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples (see item 9)
@@ -103,7 +103,7 @@ Follow these rules when implementing it:
 - **Count rerun training steps in both segments**: after a job resumes it retrains from the latest checkpoint. For example, if it is requeued at step 9,400 and resumes from the step-9,000 checkpoint, steps 9,001~9,400 run once in each segment. The time spent on the rerun is real training cost and must be counted; counting both runs makes the computed training-step time reflect the actual training rate.
 - **State the statistics window**: the whole run, or the last 1,000 steps. Everything that happens inside the window (checkpointing, evaluation pauses, etc.) is counted; a window that is too short makes the result noisy, so use at least a few hundred training steps.
 - **Use the same definition for the baseline and the new result**: when quoting the gain of a change over a baseline, recompute the baseline from the true `wall clock`; for historical data whose logs are gone and cannot be recomputed, state the original definition. If the baseline comes from the trainer log's `iteration time`, the resulting speedup is only a lower bound of the true gain.
-- **Regression gates versus cost accounting**: a regression gate (see item 6) may set its band on the median or on `iteration time` for stability, but cost accounting should still use the mean `wall clock`.
+- **Regression tests versus cost accounting**: a regression test (see item 6) may set its band on the median or on `iteration time` for stability, but cost accounting should still use the mean `wall clock`.
 
 The script below is adapted from the implementation used internally and follows the four steps above. Log formats differ between trainers, so adjust the regular expression to your actual logs.
 
@@ -277,9 +277,49 @@ Validation (2B model, 1 node × 8 GPUs): with keep-alive on, the warm-up utiliza
 
 ---
 
-## 6. Regression bands: periodically run a fixed recipe and set ranges for loss, training-step time, MFU and memory; alert when they are exceeded
+## 6. Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded
 
-To be added.
+**Idea**:
+
+![Flow diagram. Before: a merge leads straight to a long production run, and a regression is found only after that run has consumed a lot of GPU-hours. After: a merge triggers a scheduled three-leg run (checkpoint resume check, a pinned full run at 16 nodes / global batch 512 / 10,000 steps, and a comparison against bands set from a 100k-step reference run), which alerts before the next long run starts.](assets/05_a_fixed_reference_run_with_regression_bands.png)
+
+After a change to the training code (trainer, loader, kernels or environment), a stable experiment should be run periodically to check that the change has not hurt system efficiency or loss. As shown in the figure, the experiment has two steps: first a system checkpoint resume check (resume from a mid-run checkpoint and re-run the second half, to verify that the resume is correct), then a system efficiency check (a full run of a fixed recipe, configured as in production). In addition, we maintain a set of baseline system-efficiency and loss metrics as thresholds, called "bands" (the allowed range of each metric, derived from a known-good reference run); after the full run finishes it is judged against the bands, and an alert is raised when a band is exceeded (the third leg in the figure). This catches problems before the next long run starts and avoids wasting training resources.
+
+**Implementation**:
+
+After the training code is updated, two experiments are triggered periodically (each experiment is one job); if the first fails, the second is not started:
+
+1. **System checkpoint resume check**
+   - Experiment: train for a short stretch, resume from the mid-run checkpoint, and re-run the second half;
+   - Check metric: the replayed loss should track the original loss, which shows that the checkpoint, optimizer, learning-rate schedule and data iterator are restored correctly.
+2. **System efficiency check**
+   - Experiment:
+     - maintain a baseline experiment configuration and metric thresholds (bands): a fixed data mixture, initial checkpoint, sequence limit, warm-up, step count, parallel topology and global batch, using the recipe and topology that production depends on;
+     - run the full run with the baseline configuration, compare it with the thresholds when it finishes, and alert when one is exceeded;
+   - Check metrics: after the run finishes, read its steady-state window and judge each metric against its band:
+     - loss: the tail window (an upper bound plus a downward-slope check);
+     - training-step time: mean, median and p95;
+     - `MFU` and `OFU`: lower bounds only; the `HFU / OFU` ratio as a consistency check;
+     - gradient norm stays finite, compiled paths are engaged, and peak memory stays under its limit.
+
+**Experiment data**: (internal data, for reference)
+
+Baseline experiment: 2B model, stage 1, 16 nodes, global batch 512.
+
+| Metric | Reference value (measured on the known baseline) | Bound (band; alert when exceeded; ≤ is an upper bound, ≥ a lower bound) |
+|---|---:|---:|
+| Final loss (last 1,000 samples) | 1.28703 | ≤ 1.3128 |
+| `iteration time` mean | 1.68882 s | ≤ 1.85 s |
+| `iteration time` median | 1.53078 s | ≤ 1.70 s |
+| `iteration time` p95 | 2.17033 s | ≤ 2.40 s |
+| dense `MFU` mean | 16.3125% | ≥ 14% |
+| `OFU` mean | 14.5107% | ≥ 12% |
+| dense `HFU / OFU` | 1.499 | ≤ 1.80 |
+
+Notes:
+- Why the band on `iteration time` uses the median: on variable multimodal shapes, recompiles hit fewer than 0.5% of training steps but cost 10~575 s each. On a 10k-step run the mean was 3.646 s and the p95 2.40 s, while the median was 2.005 s; across two identical 3,000-step runs the p95 swung between 2.40 and 4.01 s while the median held at 2.00~2.01 s. The median is therefore the stable criterion, while the mean is still used for cost (see item 4).
+
+**When to use**: after every change that touches the trainer, the loader, the kernels or the environment, run these two experiments periodically at the production topology to keep the training system stable and efficient.
 
 ---
 
