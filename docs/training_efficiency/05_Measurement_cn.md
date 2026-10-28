@@ -397,45 +397,28 @@ class NaNForensics:
 
 ```python
 import torch
-from contextlib import nullcontext
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-_BACKENDS = {"math": SDPBackend.MATH, "cudnn": SDPBackend.CUDNN_ATTENTION}
-
-def has_nonfinite(x):
-    if torch.is_tensor(x):
-        return not torch.isfinite(x).all().item()
-    if isinstance(x, (list, tuple)):
-        return any(has_nonfinite(v) for v in x)
-    if isinstance(x, dict):
-        return any(has_nonfinite(v) for v in x.values())
-    return False
-
-def replay(model, batch, sdpa="auto"):
-    # model、batch：用保存的权重和 batch 重建（与具体模型和数据打包方式有关，这里省略）
-    first = []                                               # 第一个输出非有限值的模块
+def replay(model, batch, backend):
+    # model、batch：用保存的权重和 batch 重建（省略）
+    first = []
     def make_hook(name):
-        def hook(module, args, output):
-            if not first and has_nonfinite(output):
+        def hook(module, args, out):
+            if not first and torch.is_tensor(out) and not torch.isfinite(out).all():
                 first.append(name)
         return hook
-    hooks = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules()]
-
-    ctx = sdpa_kernel([_BACKENDS[sdpa]]) if sdpa != "auto" else nullcontext()
-    model.zero_grad(set_to_none=True)
-    anomaly = None
+    for name, m in model.named_modules():
+        m.register_forward_hook(make_hook(name))
     try:
-        with ctx, torch.autograd.detect_anomaly():           # 要同时包住 forward 和 backward
+        with sdpa_kernel([backend]), torch.autograd.detect_anomaly():   # 同时包住 forward 和 backward
             model(**batch)["loss"].backward()
-    except RuntimeError as e:                                # detect_anomaly 会指出产生 NaN 的 backward 算子
-        anomaly = str(e)[:2000]
-    for h in hooks:
-        h.remove()
-    return {"first_nonfinite_module": first[0] if first else None, "backward_anomaly": anomaly}
+    except RuntimeError as e:
+        print(e)                                                         # detect_anomaly 指出产生 NaN 的 backward 算子
+    return first[:1]                                                     # 第一个输出非有限值的模块
 
 # 换 attention 后端各跑一次：只有 cudnn 出 NaN、math 不出，说明与 kernel 相关
-for backend in ("cudnn", "math"):
-    print(backend, replay(model, batch, sdpa=backend))
+for backend in (SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
+    print(backend, replay(model, batch, backend))
 ```
 
 **实验数据**:(内部数据供参考)
