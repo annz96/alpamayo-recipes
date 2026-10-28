@@ -12,7 +12,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 
 **Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
 - Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
-- Forensics: save the scene when a non-finite gradient appears, and never add a collective to a healthy training step (see item 7)
+- NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training (see item 7)
 - Benchmark harness: skip the optimizer and measure the loader and startup time on their own (see item 8)
 - Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples (see item 9)
 - Profiler: offline trace, down to modules and operators (see item 10)
@@ -323,9 +323,90 @@ Notes:
 
 ---
 
-## 7. Forensics: save the scene when a non-finite gradient appears, and never add a collective to a healthy training step
+## 7. NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training
 
-To be added.
+**Idea**:
+
+![Flow schematic: forward / backward feeds a gradient-norm guard with a rank-local forensics hook. A finite gradient goes on to the optimizer step, with a training-step time of 3.1301 s vs 3.1302 s with forensics on vs off; a non-finite gradient branches to an orange "before" row (silent skips, about 21,000 skipped training steps, old checkpoints deleted automatically, the last clean state gone, the run cannot be resumed) or a blue "after" row (save the batch and the clean weights / optimizer shards, barrier 33~44 s against the 600 s communication timeout; stop after 5 in a row; offline replay names the first non-finite module).](assets/05_forensics_without_collectives.png)
+
+When a non-finite gradient (NaN / inf) appears, the existing gradient-norm guard only skips that optimizer step and keeps training, and it leaves behind neither the offending batch nor the weights. If the problem persists, the steps are silently skipped one after another (about 21,000 on a 32B run); meanwhile only the last few checkpoints are kept and older ones are deleted automatically, so the last clean checkpoint from before the problem is deleted too, the run cannot be resumed, and the offending batch was never saved, leaving no way to find the cause.
+The idea is to save the scene at the moment the guard fires (the offending batch and the still-clean weights and optimizer state) for offline reproduction and root-cause diagnosis, while healthy training steps only do checks that are local to each rank and add no synchronization communication between ranks.
+
+**Implementation**:
+
+After the gradient-norm guard of every training step, the trainer calls `observe`. Its `non_finite` input is the result the guard already has to synchronize to the CPU, so forensics reuses it and adds no GPU→CPU synchronization:
+
+```python
+class NaNForensics:
+    def observe(self, *, non_finite, train_step, grad_norm, save_model_fn, barrier_fn, ...):
+        spike_median = None
+        if spike_armed and not non_finite:
+            gn_value = _to_float(grad_norm)         # grad_norm is already on the CPU (synced by the guard): no new sync
+            finite_hist = [v for _, v in self._history if math.isfinite(v)]
+            if len(finite_hist) >= self._spike_min_history:     # no trigger during warm-up
+                spike_median = statistics.median(finite_hist)   # computed before appending this step
+        self._history.append((train_step, grad_norm))           # bounded deque
+
+        if not non_finite:
+            self._consecutive = 0
+            self._maybe_capture_spike(...)          # capture only: never skip or stop, and no barrier
+            self._microbatches.clear()
+            return ForensicsAction.CONTINUE
+
+        self._consecutive += 1
+        if self._consecutive == 1:                  # capture once per run of consecutive non-finite steps
+            if self._captures_done >= self._max_captures:
+                return HALT if self._consecutive >= self._halt_after else SKIP
+            self._captures_done += 1
+            try:
+                self._capture(...)                  # weights, optimizer shards, batch, per-rank record
+            except Exception as e:                  # a failed capture must not raise: this rank would never reach the barrier and the halt
+                logger.error(f"capture failed on rank {self._global_rank}: {e}")
+            if barrier_fn is not None:
+                barrier_fn()                        # every rank sees the same global grad_norm and gets here together
+        if self._consecutive >= self._halt_after:
+            return ForensicsAction.HALT
+        return ForensicsAction.SKIP
+
+    def _maybe_capture_spike(self, ...):
+        rel_spike = spike_median and gn_value > self._spike_factor * spike_median
+        abs_spike = self._spike_abs > 0 and gn_value > self._spike_abs
+        if not (rel_spike or abs_spike):
+            self._spike_consecutive = 0
+            return
+        self._spike_consecutive += 1
+        if self._spike_consecutive > 1 or self._spike_captures_done >= self._spike_max_captures:
+            return                                  # one capture per spike streak, within a budget
+        self._spike_captures_done += 1
+        self._capture(..., trigger="grad_norm_spike")
+        # Deliberately no barrier: each dp_replicate group computes grad_norm with its own all-reduce,
+        # so ranks may disagree near the threshold, and a barrier would become a mismatched collective
+
+    def halt(self, barrier_fn=None):
+        if self._abort_sentinel is not None and self._global_rank == 0:
+            self._abort_sentinel.write_text(msg)    # sentinel file: stops the scheduler from requeuing automatically
+        if barrier_fn is not None:
+            barrier_fn()                            # wait for all ranks to finish saving
+        raise NaNPersistenceError(msg)
+```
+
+**Experiment data**: (internal data, for reference)
+
+The table below validates the forensics mechanism: the overhead on the healthy path, the time to save when an event occurs, and whether the saved scene is usable:
+
+| Verification | Check | Result |
+|---|---|---|
+| Extra overhead | Does it affect the `iteration time` of healthy training steps, forensics on vs off | Mean 3.1301 s vs 3.1302 s (0.00%); medians within 0.03% |
+| Extra overhead | Healthy training steps with the compile bundle on, forensics on vs off | Mean −0.02%, within run jitter |
+| Extra overhead | Time to save when a NaN / Inf occurs | 32B model, 8 nodes: 33~44 s end to end |
+| Evidence usability | replay forward fidelity | The replay loss matches the recorded value digit for digit |
+| Evidence usability | replay reproduces and localizes | Reproduced the NaN on the rank that owns the batch and localized the first module that outputs a non-finite value |
+
+Notes:
+- Saving the scene is best-effort: when a rank fails to save (disk quota, a filesystem hiccup), it only logs the failure and does not interrupt the flow, so that all ranks can still reach the synchronization point and the stop logic.
+- Spike warning: besides non-finite gradients (NaN / inf), a gradient norm that is finite but exceeds a multiple of the trailing median (a spike) also triggers a save, because it may be a precursor of a NaN, and what is saved is the state before the NaN occurred. A spike only saves the scene; it neither skips nor stops training. One capture is made per run of consecutive spikes, at most 2 per job attempt, and nothing triggers during the first 20 finite training steps (gradient norms are naturally large during warm-up). The threshold must be calibrated per model and stage: during a healthy 32B warm-up the gradient norm reached up to 21~23 times the trailing median (2.5~4 times on 2B and 8B runs), a threshold of 20 times false-fired and wasted the capture budget, while a threshold of 100 times did not false-fire.
+
+**When to use**: after a NaN / inf gradient appears it is hard to reproduce, so deploy the forensics mechanism in advance and save the scene on the spot when it happens.
 
 ---
 

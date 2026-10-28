@@ -12,7 +12,7 @@
 
 **持续监控与辅助方法**:训练中的持续记录与回归监控,以及单独测量某一段的方法（第 6~10 项持续补充中）
 - 回归测试: 代码改动后定期跑固定配方,与基线阈值（带）对比,超出就报警 (见第 6 项)
-- 取证: 出现非有限梯度时保存现场,不在健康训练 step 上加 collective (见第 7 项)
+- NaN / inf 梯度取证: 出现时保存现场用于复现和定位,平时不拖慢训练 (见第 7 项)
 - benchmark harness: 跳过 optimizer,单独量 loader 与启动时间 (见第 8 项)
 - 分项 loss 与截断日志: 各项 loss 分开记,截断样本留身份 (见第 9 项)
 - profiler: 离线 trace,细到模块和算子 (见第 10 项)
@@ -323,9 +323,90 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 
 ---
 
-## 7. 取证: 出现非有限梯度时保存现场,不在健康训练 step 上加 collective
+## 7. NaN / inf 梯度取证: 出现时保存现场用于复现和定位,平时不拖慢训练
 
-待补充。
+**思路**:
+
+![流程示意：forward / backward 进入梯度范数 guard（带 rank 本地的取证 hook）。梯度有限则进入 optimizer step，取证开 / 关的训练 step 时间为 3.1301 s 与 3.1302 s；梯度非有限则分叉成橙色“改动前”（静默跳过，约 21,000 个被跳过的训练 step，旧的 checkpoint 被自动删除，最后一份干净状态也没了，run 无法接着训练）或蓝色“改动后”（保存 batch 和干净的权重 / optimizer 分片，barrier 33~44 s，对 600 s 通信超时上限；连续 5 次后停止，离线 replay 点名第一个非有限的模块）。](assets/05_forensics_without_collectives.png)
+
+训练出现非有限梯度（NaN / inf）时，原有的梯度范数 guard 只会跳过这次 optimizer step 并继续训练，不留下出事的 batch 和权重。问题持续时，step 会被静默地一直跳过（在一个 32B run 上约 21,000 个），同时，checkpoint 只保留最近几份，旧的会被自动删除，出问题之前最后一份干净的 checkpoint 也被删掉了，run 无法接着训练；出事的 batch 也没有保存下来，原因无从查起。
+思路是在 guard 触发的当下保存现场（出事的 batch、仍然干净的权重和 optimizer 状态），供离线复现和定位根因；同时，健康的训练 step 上只做各 rank 本地的检查，不增加 rank 之间的同步通信。
+
+**实现**:
+
+trainer 在每个训练 step 的梯度范数 guard 之后调用 `observe`，其中 `non_finite` 是 guard 本来就要同步到 CPU 的结果，取证直接复用，不新增 GPU→CPU 同步：
+
+```python
+class NaNForensics:
+    def observe(self, *, non_finite, train_step, grad_norm, save_model_fn, barrier_fn, ...):
+        spike_median = None
+        if spike_armed and not non_finite:
+            gn_value = _to_float(grad_norm)         # grad_norm 是 guard 已经同步到 CPU 的值，不新增同步
+            finite_hist = [v for _, v in self._history if math.isfinite(v)]
+            if len(finite_hist) >= self._spike_min_history:     # warm-up 期间不触发
+                spike_median = statistics.median(finite_hist)   # 在追加本步之前计算
+        self._history.append((train_step, grad_norm))           # 有界 deque
+
+        if not non_finite:
+            self._consecutive = 0
+            self._maybe_capture_spike(...)          # 只保存，不跳过、不停止，也不设 barrier
+            self._microbatches.clear()
+            return ForensicsAction.CONTINUE
+
+        self._consecutive += 1
+        if self._consecutive == 1:                  # 一段连续的非有限，只保存一次
+            if self._captures_done >= self._max_captures:
+                return HALT if self._consecutive >= self._halt_after else SKIP
+            self._captures_done += 1
+            try:
+                self._capture(...)                  # 权重、optimizer 分片、batch、逐 rank 记录
+            except Exception as e:                  # 保存失败不能抛出：否则这个 rank 到不了 barrier 和 halt
+                logger.error(f"capture failed on rank {self._global_rank}: {e}")
+            if barrier_fn is not None:
+                barrier_fn()                        # 各 rank 看到同一个全局 grad_norm，一起走到这里
+        if self._consecutive >= self._halt_after:
+            return ForensicsAction.HALT
+        return ForensicsAction.SKIP
+
+    def _maybe_capture_spike(self, ...):
+        rel_spike = spike_median and gn_value > self._spike_factor * spike_median
+        abs_spike = self._spike_abs > 0 and gn_value > self._spike_abs
+        if not (rel_spike or abs_spike):
+            self._spike_consecutive = 0
+            return
+        self._spike_consecutive += 1
+        if self._spike_consecutive > 1 or self._spike_captures_done >= self._spike_max_captures:
+            return                                  # 一段尖峰只保存一次，且有预算
+        self._spike_captures_done += 1
+        self._capture(..., trigger="grad_norm_spike")
+        # 故意不设 barrier：各 dp_replicate 组用独立的 all-reduce 算 grad_norm，
+        # 阈值附近各 rank 的判断可能不一致，此时 barrier 会变成对不上的 collective
+
+    def halt(self, barrier_fn=None):
+        if self._abort_sentinel is not None and self._global_rank == 0:
+            self._abort_sentinel.write_text(msg)    # 哨兵文件：阻止调度器自动重新排队
+        if barrier_fn is not None:
+            barrier_fn()                            # 等所有 rank 保存完
+        raise NaNPersistenceError(msg)
+```
+
+**实验数据**:(内部数据供参考)
+
+下表为取证机制的验证，包括健康路径上的开销、出事时的保存耗时，以及保存下来的现场是否可用：
+
+| 验证项 | 检查 | 结果 |
+|---|---|---|
+| 额外开销验证 | 是否对健康训练 step 的 `iteration time`有影响，取证开 vs 关 | 均值 3.1301 s vs 3.1302 s（0.00%）；中位数相差 < 0.03% |
+| 额外开销验证 | 是否对健康训练 step，开 compile bundle 时的开 / 关 | 均值 −0.02%，在 run 抖动之内 |
+| 额外开销验证 | 出现 NaN/Inf 问题时保存耗时 | 32B 模型，8 节点：端到端 33~44 s |
+| 证据可用性验证 | replay 的 forward 保真度 | replay 的 loss 与记录值逐位一致 |
+| 证据可用性验证 | replay 复现并定位 | 在拥有该 batch 的 rank 上复现了 NaN，并定位到最先输出非有限值的模块 |
+
+说明：
+- 现场保存是尽力而为：某个 rank 保存失败（磁盘配额、文件系统抖动）时只记录日志，不中断流程，让所有 rank 都能走到同步点和停止逻辑。
+- 尖峰预警：除了非有限梯度（NaN / inf）要保存现场，梯度范数虽然有限、但超过近期中位数一定倍数（尖峰）时也要保存，因为它可能是 NaN 的前兆，保存的是 NaN 发生之前的状态。尖峰只保存现场，不跳过也不停止训练；一段连续的尖峰只保存一次，每次 job attempt 最多 2 次，前 20 个有限训练 step 不触发（warm-up 期间梯度范数本来就大）。阈值需要按模型和阶段校准：健康的 32B warm-up 中，梯度范数最高达到近期中位数的 21~23 倍（2B 和 8B 的 run 上为 2.5~4 倍），阈值设为 20 倍会误报、白白用掉捕获预算，设为 100 倍则没有误报。
+
+**适用场景**：NaN / inf 梯度出现后很难复现，提前部署取证机制，出现时当场保存现场。
 
 ---
 
