@@ -443,7 +443,70 @@ for backend in (SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
 
 ## 8. benchmark harness: 跳过 optimizer,单独量 loader 与启动时间
 
-待补充。
+**思路**:
+
+![两个面板。左：完整训练 step（loader 等待、forward / backward、optimizer）在上，skip_compute 的训练 step 被缩成“loader 交付 + 一个 dummy step”（示意）。右：79.23 s 的启动 wall clock 总数在上，其阶段拆解在下，dataset 实例化 71.42 s（90.1%）。](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
+
+**解决的问题**：优化 loader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来，否则会被 optimizer、集体通信等开销掩盖。启动时间则要拆到每个阶段，才知道慢在哪：由几十个数据集组成的混合，构造数据集就可能超过一分钟，一个 wall clock 总数看不出哪个阶段慢。
+
+**思路**：做一个只跑目标阶段、不改动生产代码路径的 harness：
+- trainer 的 benchmark 模式：配置里一个开关让 trainer 跳过 forward / backward、梯度裁剪和 optimizer step，只保留数据路径（数据集、packer、H2D 拷贝）。这时测得的训练 step 时间就是数据路径的交付速率，其他诊断的开销也可以单独测，第 5 项里 keep-alive 的开销就是这样测的；
+- 启动 harness：按生产的方式构造训练输入（配置组装、数据集构造、混合 sampler 设置、第一个 batch），给每个阶段计时。它调用的是生产的构造器而不是一份拷贝，所以会随代码一起演化。
+
+**实现**:
+
+trainer 的 benchmark 模式（节选自内部实现，省略了日志和占位 loss 的细节）：
+
+```python
+# 配置：[custom.benchmark] skip_compute = true
+self._skip_compute = bool(custom.get("benchmark", {}).get("skip_compute", False))
+
+# 每个 mini-batch：数据路径照常运行（collate、H2D），跳过 forward / backward
+raw_batch = misc.to(raw_batch, device=self.device)
+batch = self.data_packer.sft_collate_fn(raw_batch, ...)
+batch = misc.to(batch, device=self.device)
+if self._skip_compute:
+    loss_flat, loss_flat_keys = self._accumulate_skip_compute_loss(aux_loss_dict)   # 放一个 0 维占位 loss，后面的指标归约照常
+    continue
+
+# 每个训练 step 的末尾：跳过梯度归约、裁剪、optimizer.step 和学习率 step
+if self._skip_compute:
+    grad_norm = None
+else:
+    ...
+
+# 记录每个训练 step 的 wall time（在已有的日志 all-reduce 之后，各 rank 处于同一步）
+def _record_step_wall_time(self):
+    now = time.perf_counter()
+    if self._last_step_enter_t is not None:
+        self._step_wall_times_s.append(now - self._last_step_enter_t)
+    self._last_step_enter_t = now
+```
+
+启动 harness（示意）：
+
+```python
+with timed("dataset_init"):  ds = build_train_dataset(cfg)         # 调用生产的构造器
+with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个阶段计时
+```
+
+**实验数据**:(内部数据供参考)
+
+启动拆解（2B 模型 stage 1 配置，37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数）：
+
+| 阶段 | 时间 | 占比 |
+|---|---:|---:|
+| 训练输入初始化总计 | 79.230 s | 100.0% |
+| dataset 实例化 | 71.420 s | 90.1% |
+| 配置组装（Hydra） | 6.263 s | 7.9% |
+| sampler 设置 | 1.546 s | 2.0% |
+| 第一个 batch | 0.0004 s | 约 0% |
+
+说明：
+- 启动耗时的九成是数据集构造；harness 为每个子数据集记录阶段，所以下一个问题（哪个数据集、哪个阶段）可以从同一份结果里回答。
+- 跳过计算会拿走 GPU 的背压：loader 以不受争用的速率运行，而 trainer 的 kernel launch 线程和 worker 进程之间的干扰（第 3 项里的 launch 间隙）在没有 kernel 被 launch 时就不存在。所以一个跟得上 benchmark 模式的 loader，不一定跟得上真实的训练 step。
+
+**适用场景**：把 loader 吞吐从计算里隔离出来、把启动时间归因到阶段，或者测量某个诊断自身的开销；不用来给出最终数字，最终数字要用真实训练 step 的 `wall clock`（见第 2 项）。
 
 ---
 

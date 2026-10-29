@@ -445,7 +445,70 @@ Notes:
 
 ## 8. Benchmark harness: skip the optimizer and measure the loader and startup time on their own
 
-To be added.
+**Idea**:
+
+![Two panels. Left: a full training step (loader wait, forward / backward, optimizer) above a skip_compute training step reduced to "loader delivery + a dummy step" (schematic). Right: a 79.23 s startup wall-clock total above its phase breakdown, with dataset instantiation at 71.42 s (90.1%).](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
+
+**Problem**: when optimizing the loader, to see how much faster it really got, the data time has to be separated from the training step; otherwise it is masked by the optimizer, collective communication and other costs. Startup time has to be broken down by phase to know where it is slow: for a mixture of dozens of datasets, constructing the datasets alone can take more than a minute, and a single wall-clock total does not show which phase is slow.
+
+**Idea**: build a harness that runs only the stage of interest and does not change the production code path:
+- the trainer's benchmark mode: a config switch makes the trainer skip forward / backward, gradient clipping and the optimizer step, and keep only the data path (dataset, packer, H2D copy). The measured training-step time is then the delivery rate of the data path, and the cost of other diagnostics can also be measured alone; the keep-alive cost in item 5 was measured this way;
+- the startup harness: construct the training input the way production does (configuration composition, dataset construction, mixture sampler setup, first batch) and time each phase. It calls the production constructors rather than a copy, so it evolves with the code.
+
+**Implementation**:
+
+The trainer's benchmark mode (excerpted from the internal implementation, with logging and placeholder-loss details omitted):
+
+```python
+# config: [custom.benchmark] skip_compute = true
+self._skip_compute = bool(custom.get("benchmark", {}).get("skip_compute", False))
+
+# every mini-batch: the data path runs as usual (collate, H2D); forward / backward are skipped
+raw_batch = misc.to(raw_batch, device=self.device)
+batch = self.data_packer.sft_collate_fn(raw_batch, ...)
+batch = misc.to(batch, device=self.device)
+if self._skip_compute:
+    loss_flat, loss_flat_keys = self._accumulate_skip_compute_loss(aux_loss_dict)   # put in a 0-dim placeholder loss; the metric reduction afterwards runs as usual
+    continue
+
+# end of every training step: skip gradient reduction, clipping, optimizer.step and the learning-rate step
+if self._skip_compute:
+    grad_norm = None
+else:
+    ...
+
+# record the wall time of every training step (after the existing logging all-reduce, when all ranks are at the same step)
+def _record_step_wall_time(self):
+    now = time.perf_counter()
+    if self._last_step_enter_t is not None:
+        self._step_wall_times_s.append(now - self._last_step_enter_t)
+    self._last_step_enter_t = now
+```
+
+The startup harness (illustrative):
+
+```python
+with timed("dataset_init"):  ds = build_train_dataset(cfg)         # calls the production constructor
+with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # times each phase
+```
+
+**Experiment data**: (internal data, for reference)
+
+Startup breakdown (2B model, stage 1 configuration, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time):
+
+| Phase | Time | Share |
+|---|---:|---:|
+| Total training-input initialization | 79.230 s | 100.0% |
+| Dataset instantiation | 71.420 s | 90.1% |
+| Configuration composition (Hydra) | 6.263 s | 7.9% |
+| Sampler setup | 1.546 s | 2.0% |
+| First batch | 0.0004 s | about 0% |
+
+Notes:
+- Nine tenths of startup is dataset construction; the harness records the phase for every child dataset, so the next question (which dataset, which phase) can be answered from the same result.
+- Skipping compute removes GPU back-pressure: the loader runs at its uncontended rate, and the interference between the trainer's kernel-launch thread and the worker processes (the launch gaps in item 3) does not exist when no kernels are launched. A loader that keeps up with the benchmark mode therefore may not keep up with a real training step.
+
+**When to use**: isolating loader throughput from compute, attributing startup time to phases, or measuring the cost of a diagnostic itself; not for giving the final number, which should be the `wall clock` of the real training step (see item 2).
 
 ---
 
