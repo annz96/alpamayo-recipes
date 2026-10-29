@@ -447,13 +447,11 @@ for backend in (SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
 
 ![两个面板。左：完整训练 step（dataloader 等待、forward / backward、optimizer）在上，skip_compute 的训练 step 被缩成“dataloader 交付 + 一个 dummy step”（示意）。右：79.23 s 的启动 wall clock 总数在上，其阶段拆解在下，dataset 实例化 71.42 s（90.1%）。](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
 
-优化 dataloader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来。原因是 dataloader 的 worker 在后台预取下一个 batch，和当前 step 的计算并行：只要 dataloader 比计算快，它的耗时就被计算盖住，完整训练里只会露出没被盖住的那部分等待（图左上的 loader wait），改进看不出来。所以做一个只跑目标阶段、不改动生产代码路径的 harness：
-- trainer 的 benchmark 模式：配置里一个开关让 trainer 跳过 forward / backward、梯度裁剪和 optimizer step，只保留数据路径（数据集、packer、H2D 拷贝）。这时没有计算可以盖住 dataloader，测得的训练 step 时间就是数据路径完整的交付速率（图左下），其他诊断的开销也可以单独测，第 5 项里 keep-alive 的开销就是这样测的；
-- 启动 harness：启动时间也一样，由几十个数据集组成的混合，构造数据集就可能超过一分钟，而一个 wall clock 总数（图右上）看不出哪个阶段慢。harness 按生产的方式构造训练输入（配置组装、数据集构造、混合 sampler 设置、第一个 batch），给每个阶段计时（图右下）。它调用的是生产的构造器而不是一份拷贝，所以会随代码一起演化。
+优化 dataloader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来。原因是 dataloader 的 worker 在后台预取下一个 batch，和当前 step 的计算并行：只要 dataloader 比计算快，它的耗时就被计算盖住，完整训练里只会露出没被盖住的那部分等待（图左上的 loader wait），改进看不出来。所以做一个只跑目标阶段、不改动生产代码路径的 benchmark mode(图左下), 只体现数据处理的耗时和其内部的开销占比startup harness(图右下）。
 
 **实现**:
 
-trainer 的 benchmark 模式（节选自内部实现，省略了日志和占位 loss 的细节）：
+benchmark mode(skip compute)：
 
 ```python
 # 配置：[custom.benchmark] skip_compute = true
@@ -481,7 +479,7 @@ def _record_step_wall_time(self):
     self._last_step_enter_t = now
 ```
 
-启动 harness（示意）：
+dataloader harness：
 
 ```python
 with timed("dataset_init"):  ds = build_train_dataset(cfg)         # 调用生产的构造器
@@ -490,7 +488,9 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 
 **实验数据**:(内部数据供参考)
 
-下表为启动 harness 的结果，说明启动时间可以拆到各个阶段，从而知道该优化哪里。启动拆解（2B 模型 stage 1 配置，37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数）：
+下表为benchmark mode下，启动 harness 的结果。可用来分析 dataloader 启动各阶段的开销，从而知道该优化哪里。
+
+配置：2B 模型 stage 37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数）：
 
 | 阶段 | 时间 | 占比 |
 |---|---:|---:|
@@ -501,11 +501,10 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 | 第一个 batch | 0.0004 s | 约 0% |
 
 说明：
-- 启动耗时的九成是数据集构造；harness 为每个子数据集记录阶段，所以下一个问题（哪个数据集、哪个阶段）可以从同一份结果里回答。
-- 跳过计算会拿走 GPU 的背压：dataloader 以不受争用的速率运行，而 trainer 的 kernel launch 线程和 worker 进程之间的干扰（第 3 项里的 launch 间隙）在没有 kernel 被 launch 时就不存在。所以一个跟得上 benchmark 模式的 dataloader，不一定跟得上真实的训练 step。
-- benchmark 模式没有单独的结果表，它的应用例子见第 5 项：“仅空转（跳过计算）”的 run 就是跳过训练计算、单独测空转 kernel 自身的利用率和功耗（`OFU` 约 0%，功耗约 123 W）。
+- 启动耗时的九成是dataset 实例化。
+- benchmark 模式测得的是 dataloader 的最好情况：跳过计算后没有 kernel 需要 launch，trainer 的 CPU 线程不再和 dataloader 的 worker 进程争抢 CPU（第 3 项里 `forward` 多出的 0.28 s 就是这种争抢造成的），dataloader 以不受干扰的速率运行。所以一个在 benchmark 模式下跟得上的 dataloader，在真实训练里可能因为 CPU 争用而变慢，最终结论要以真实训练 step 为准。
 
-**适用场景**：把 dataloader 吞吐从计算里隔离出来、把启动时间归因到阶段，或者测量某个诊断自身的开销；不用来给出最终数字，最终数字要用真实训练 step 的 `wall clock`（见第 2 项）。
+**适用场景**：dataloader优化，可以把 dataloader 吞吐从计算里隔离出来具体分析。
 
 ---
 

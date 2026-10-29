@@ -504,7 +504,7 @@ The table below shows the result of the startup harness: startup time can be bro
 
 Notes:
 - Nine tenths of startup is dataset construction; the harness records the phase for every child dataset, so the next question (which dataset, which phase) can be answered from the same result.
-- Skipping compute removes GPU back-pressure: the dataloader runs at its uncontended rate, and the interference between the trainer's kernel-launch thread and the worker processes (the launch gaps in item 3) does not exist when no kernels are launched. A dataloader that keeps up with the benchmark mode therefore may not keep up with a real training step.
+- The benchmark mode measures the best case for the dataloader: with compute skipped, no kernels need to be launched, so the trainer's CPU thread no longer competes with the dataloader worker processes for CPU (the extra 0.28 s in `forward` in item 3 was caused by exactly this competition), and the dataloader runs undisturbed. A dataloader that keeps up in the benchmark mode may therefore slow down in real training because of CPU contention, so the final conclusion must rest on the real training step.
 - The benchmark mode has no result table of its own; an application is in item 5: the "spin only (compute skipped)" run skips the training compute to measure the utilization and power of the spin kernel alone (`OFU` about 0%, power about 123 W).
 
 **When to use**: isolating dataloader throughput from compute, attributing startup time to phases, or measuring the cost of a diagnostic itself; not for giving the final number, which should be the `wall clock` of the real training step (see item 2).
