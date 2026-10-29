@@ -13,7 +13,7 @@
 **持续监控与辅助方法**:训练中的持续记录与回归监控,以及单独测量某一段的方法（第 6~10 项持续补充中）
 - 回归测试: 代码改动后定期跑固定配方,与基线阈值（带）对比,超出就报警 (见第 6 项)
 - NaN / inf 梯度取证: 出现时保存现场用于复现和定位,平时不拖慢训练 (见第 7 项)
-- benchmark harness: 跳过 optimizer,单独量 loader 与启动时间 (见第 8 项)
+- benchmark harness: 跳过 optimizer,单独量 dataloader 与启动时间 (见第 8 项)
 - 分项 loss 与截断日志: 各项 loss 分开记,截断样本留身份 (见第 9 项)
 - profiler: 离线 trace,细到模块和算子 (见第 10 项)
 
@@ -22,7 +22,7 @@
 | 症状 | 表现 | 看哪些指标 |
 |---|---|---|
 | 训练 step 慢于硬件预期，原因不明 | 设备利用率（`sm%`）高、loss 正常，但每个训练 step 的 `wall clock` 比硬件预期长 | 真实 `wall clock / step`;`arrival`、`forward`、`backward`、`host residual` (详见第 2、3 项;细到模块和算子见第 10 项) |
-| 单个 rank 拖慢所有 rank | 各训练 step 的 `wall clock` 均值远高于中位数；周期性出现多秒的训练 step，此时有的 rank 在等 batch，有的 rank 已在等梯度同步 | `arrival`(即 data wait)、`severe stall`、`stall gap`、`clean step` (详见第 1 项;单独量 loader 见第 8 项) |
+| 单个 rank 拖慢所有 rank | 各训练 step 的 `wall clock` 均值远高于中位数；周期性出现多秒的训练 step，此时有的 rank 在等 batch，有的 rank 已在等梯度同步 | `arrival`(即 data wait)、`severe stall`、`stall gap`、`clean step` (详见第 1 项;单独量 dataloader 见第 8 项) |
 | 每个训练 step 都有固定的额外开销 | 各训练 step 的 `wall clock` 均值与中位数接近（没有长尾），但都高于对照配置：每个训练 step 都稳定地多花一段时间 | `forward`、`backward`、`host residual` (详见第 3 项;细到算子见第 10 项) |
 | GPU 利用率接近 100%，但吞吐偏低 | 设备利用率（`sm%`）接近 100%，但 `OFU` 很低、功耗接近空闲 | `MFU`、`HFU`、`OFU`、`HFU / OFU`、功耗;不看设备利用率(`sm%`) (详见第 5 项) |
 | 汇报的数字与实际 GPU-hour 账单不一致 | 日志里的 `iteration time` 低于真实 `wall clock`；或用中位数估算的成本，低于实际 `GPU-hour` 账单 | 真实 `wall clock / step`、`GPU-hour`(用均值),对照 `iteration time` (详见第 2、4 项) |
@@ -35,14 +35,14 @@
 
 ![左：stage 2 训练的一个 run，仅有 job 级别的 iteration time，中位数为 1.254 s、均值为 2.688 s，两者的差距无法解释。右（示意）：逐 rank 记录将各 rank 等待 batch 的时间（橙色）与计算时间（蓝色）分开，可直接看出到达较晚的 rank 3，以及用于定义 severe stall 的 2 s 到达时间差。](assets/05_per_rank_step_telemetry_with_a_severe_stall_metric.png)
 
-同步数据并行训练中，训练 step 的时长由最慢的 rank 决定。仅凭 job 级别的单步耗时，无法区分以下情形：是单个 rank 变慢还是所有 rank 变慢；是数据供给不足（个别 rank 的 batch 到达较晚，或整个 loader 落后），还是计算本身变慢（个别节点异常或受到干扰，或整体变慢）。不同情形的处理方式不同，因此需要先定位。
+同步数据并行训练中，训练 step 的时长由最慢的 rank 决定。仅凭 job 级别的单步耗时，无法区分以下情形：是单个 rank 变慢还是所有 rank 变慢；是数据供给不足（个别 rank 的 batch 到达较晚，或整个 dataloader 落后），还是计算本身变慢（个别节点异常或受到干扰，或整体变慢）。不同情形的处理方式不同，因此需要先定位。
 每个训练 step，每个 rank 产生一条记录，由 rank 0 汇总。由这些记录可导出四个量：
 - `instrument wall`：每个训练 step 中，各 rank 的 `arrival`（等待 batch 的时间）与 `arrival-else`（收到 batch 之后到 step 结束的时间，含 H2D 拷贝、forward、backward、梯度同步）之和，取各 rank 中的最大值，即最慢 rank（如图中的 rank 3）的训练 step 总耗时；
 - `severe stall`：各 rank 到达时间`arrival`之差（最大值减最小值,如图rank3和ranke0）大于 2 s 的训练 step，表示存在 rank 在等待数据；
-- `clean step`：最大 arrival 不超过 0.1 s 的训练 step，表示 loader 没有造成可见的等待；
+- `clean step`：最大 arrival 不超过 0.1 s 的训练 step，表示 dataloader 没有造成可见的等待；
 - `stall gap`：全部训练 step 的 `instrument wall` 均值，减去 `clean step` 的 `instrument wall` 均值，即 stall 带来的额外耗时。
 
-stall 指标取“差值”而不是绝对值：若一个 rank 等待 11 s 而其他 rank 仅等待 0.1 s，无论计算耗时如何，都说明 loader 出现了问题。分析时应以决定训练 step 时长的那个 rank 为准，而不是对各 rank 取平均；并同时报告均值、中位数、severe 比例以及 arrival 的 p95 / p99，这四项分别对应四种不同的失败形态。
+stall 指标取“差值”而不是绝对值：若一个 rank 等待 11 s 而其他 rank 仅等待 0.1 s，无论计算耗时如何，都说明 dataloader 出现了问题。分析时应以决定训练 step 时长的那个 rank 为准，而不是对各 rank 取平均；并同时报告均值、中位数、severe 比例以及 arrival 的 p95 / p99，这四项分别对应四种不同的失败形态。
 
 **实现**:
 
@@ -68,8 +68,8 @@ sev  = sum(1 for r in sel
 
 | 配置 | `instrument wall` 均值 (s) | `instrument wall` 中位数 (s) | `severe stall` 比例 | `arrival` p95 (s) | 判断 |
 |---|---:|---:|---:|---:|---|
-| 配置 A | 2.138 | 1.104 | 18.0% | 6.78 | 均值远高于中位数，`severe stall` 比例高：长尾延迟问题，应优化 loader 的供给稳定性 |
-| 配置 B | 1.576 | 1.556 | 0.0% | 0.29 | 均值接近中位数，无 stall：loader 供给稳定，应进一步排查 compute 等开销（见第 3 项 CUDA event 分解） |
+| 配置 A | 2.138 | 1.104 | 18.0% | 6.78 | 均值远高于中位数，`severe stall` 比例高：长尾延迟问题，应优化 dataloader 的供给稳定性 |
+| 配置 B | 1.576 | 1.556 | 0.0% | 0.29 | 均值接近中位数，无 stall：dataloader 供给稳定，应进一步排查 compute 等开销（见第 3 项 CUDA event 分解） |
 
 说明：
 - 本章的表格采用 `severe stall` 的定义（各 rank 到达时间差 > 2 s）。其他资料中也可能采用 `absolute stall` 的定义（最慢 rank 的等待 > 5 s），使用时应注明所采用的是哪一种。
@@ -152,7 +152,7 @@ step_time = tot_s / tot_n                                   # 秒数之和 / 步
 
 做法：启用逐 rank 遥测后，trainer 用 CUDA event（`torch.cuda.Event(enable_timing=True)`，由 GPU 在自己的 stream 上打的时间戳）包住 forward 和 backward。两个 event 之间的时间**包含 GPU 等待 CPU 提交下一个 kernel 的间隙**，即 event 区间 = kernel 时间 + launch 间隙。
 
-于是在决定训练 step 时长的那个 rank 上，一个训练 step 分为四段：`arrival`（loader 遥测）、`forward` 和 `backward`（event）、`host residual`（ `arrival-else` − forward − backward，即数据搬运、optimizer 的 host 侧开销、阶段之间的 Python 代码）。读法：`host residual` 变长，说明阶段之间的 host 代码变慢；`forward` 或 `backward` 变长而 kernel 和数据都没有变，则只可能是 launch 间隙，即向 GPU 提交 kernel 的 CPU 线程受到了干扰。
+于是在决定训练 step 时长的那个 rank 上，一个训练 step 分为四段：`arrival`（dataloader 遥测）、`forward` 和 `backward`（event）、`host residual`（ `arrival-else` − forward − backward，即数据搬运、optimizer 的 host 侧开销、阶段之间的 Python 代码）。读法：`host residual` 变长，说明阶段之间的 host 代码变慢；`forward` 或 `backward` 变长而 kernel 和数据都没有变，则只可能是 launch 间隙，即向 GPU 提交 kernel 的 CPU 线程受到了干扰。
 
 **实现**:
 
@@ -173,7 +173,7 @@ event 在 forward 前后、`loss.backward()` 前后各放一对。实现时需�
 
 **实验数据**:(内部数据供参考)
 
-实验背景：在优化 data loader 的过程中，发现除 `arrival`（等待 batch）之外，`arrival-else` 变长了（配置 B 中，每个训练 step 的 `arrival-else` 明显增加），需要用 CUDA event 进一步判断是哪一段变长。
+实验背景：在优化 dataloader 的过程中，发现除 `arrival`（等待 batch）之外，`arrival-else` 变长了（配置 B 中，每个训练 step 的 `arrival-else` 明显增加），需要用 CUDA event 进一步判断是哪一段变长。
 
 实验目的：通过拆解判断瓶颈在哪一段，从而确定优化方向。
 
@@ -283,7 +283,7 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 
 ![流程图。改动前：合入后直接进入长跑生产，待该 run 消耗大量 GPU-hour 之后才发现回归。改动后：合入触发定期的三段式 run（checkpoint 续跑检查、16 节点 / global batch 512 / 10,000 步的固定完整 run、对照 100k 步参照跑设带做指标判定），在下一个长跑启动前报警。](assets/05_a_fixed_reference_run_with_regression_bands.png)
 
-训练代码改动（trainer、loader、kernel 或环境）之后，需要定期跑一套稳定的实验，检查这些改动没有对系统效率和 loss 带来负面影响。如图所示，稳定性实验分为两步：先做系统 checkpoint 续跑检查（从中间的 checkpoint 恢复并重跑后半段，验证恢复是否正确），再做系统效率检查（跑固定配方的完整 run，配置与生产一致）。另外，我们维护一组基线的系统效率和 loss 指标作为阈值，称为“带”（band，即各指标允许的范围，来自已知良好的参照 run）；完整 run 结束后按带判定，超出就报警（即图中的第三段）。这样可以在下一个长跑启动之前预先发现问题，减少不必要的训练资源浪费。
+训练代码改动（trainer、dataloader、kernel 或环境）之后，需要定期跑一套稳定的实验，检查这些改动没有对系统效率和 loss 带来负面影响。如图所示，稳定性实验分为两步：先做系统 checkpoint 续跑检查（从中间的 checkpoint 恢复并重跑后半段，验证恢复是否正确），再做系统效率检查（跑固定配方的完整 run，配置与生产一致）。另外，我们维护一组基线的系统效率和 loss 指标作为阈值，称为“带”（band，即各指标允许的范围，来自已知良好的参照 run）；完整 run 结束后按带判定，超出就报警（即图中的第三段）。这样可以在下一个长跑启动之前预先发现问题，减少不必要的训练资源浪费。
 
 **实现**:
 
@@ -319,7 +319,7 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 说明：
 - 对 `iteration time` 设中位数的带：在可变多模态 shape 上，recompile 只发生在不到 0.5% 的训练 step，但每次耗时 10~575 s。10k 步 run 上均值为 3.646 s、p95 为 2.40 s，而中位数为 2.005 s；两个相同的 3,000 步 run 之间，p95 在 2.40~4.01 s 之间波动，中位数则稳定在 2.00~2.01 s。因此中位数是稳定的判据，均值仍用于成本（见第 4 项）。
 
-**适用场景**：在每次涉及 trainer、loader、kernel 或环境的变更合入之后，按生产的 topology 定期跑这两个实验，保证训练系统的稳定性和效率。
+**适用场景**：在每次涉及 trainer、dataloader、kernel 或环境的变更合入之后，按生产的 topology 定期跑这两个实验，保证训练系统的稳定性和效率。
 
 ---
 
@@ -441,14 +441,14 @@ for backend in (SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
 
 ---
 
-## 8. benchmark harness: 跳过 optimizer,单独量 loader 与启动时间
+## 8. benchmark harness: 跳过 optimizer,单独量 dataloader 与启动时间
 
 **思路**:
 
-![两个面板。左：完整训练 step（loader 等待、forward / backward、optimizer）在上，skip_compute 的训练 step 被缩成“loader 交付 + 一个 dummy step”（示意）。右：79.23 s 的启动 wall clock 总数在上，其阶段拆解在下，dataset 实例化 71.42 s（90.1%）。](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
+![两个面板。左：完整训练 step（dataloader 等待、forward / backward、optimizer）在上，skip_compute 的训练 step 被缩成“dataloader 交付 + 一个 dummy step”（示意）。右：79.23 s 的启动 wall clock 总数在上，其阶段拆解在下，dataset 实例化 71.42 s（90.1%）。](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
 
-优化 loader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来。原因是 loader 的 worker 在后台预取下一个 batch，和当前 step 的计算并行：只要 loader 比计算快，它的耗时就被计算盖住，完整训练里只会露出没被盖住的那部分等待（图左上的 loader wait），改进看不出来。所以做一个只跑目标阶段、不改动生产代码路径的 harness：
-- trainer 的 benchmark 模式：配置里一个开关让 trainer 跳过 forward / backward、梯度裁剪和 optimizer step，只保留数据路径（数据集、packer、H2D 拷贝）。这时没有计算可以盖住 loader，测得的训练 step 时间就是数据路径完整的交付速率（图左下），其他诊断的开销也可以单独测，第 5 项里 keep-alive 的开销就是这样测的；
+优化 dataloader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来。原因是 dataloader 的 worker 在后台预取下一个 batch，和当前 step 的计算并行：只要 dataloader 比计算快，它的耗时就被计算盖住，完整训练里只会露出没被盖住的那部分等待（图左上的 loader wait），改进看不出来。所以做一个只跑目标阶段、不改动生产代码路径的 harness：
+- trainer 的 benchmark 模式：配置里一个开关让 trainer 跳过 forward / backward、梯度裁剪和 optimizer step，只保留数据路径（数据集、packer、H2D 拷贝）。这时没有计算可以盖住 dataloader，测得的训练 step 时间就是数据路径完整的交付速率（图左下），其他诊断的开销也可以单独测，第 5 项里 keep-alive 的开销就是这样测的；
 - 启动 harness：启动时间也一样，由几十个数据集组成的混合，构造数据集就可能超过一分钟，而一个 wall clock 总数（图右上）看不出哪个阶段慢。harness 按生产的方式构造训练输入（配置组装、数据集构造、混合 sampler 设置、第一个 batch），给每个阶段计时（图右下）。它调用的是生产的构造器而不是一份拷贝，所以会随代码一起演化。
 
 **实现**:
@@ -502,10 +502,10 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 
 说明：
 - 启动耗时的九成是数据集构造；harness 为每个子数据集记录阶段，所以下一个问题（哪个数据集、哪个阶段）可以从同一份结果里回答。
-- 跳过计算会拿走 GPU 的背压：loader 以不受争用的速率运行，而 trainer 的 kernel launch 线程和 worker 进程之间的干扰（第 3 项里的 launch 间隙）在没有 kernel 被 launch 时就不存在。所以一个跟得上 benchmark 模式的 loader，不一定跟得上真实的训练 step。
+- 跳过计算会拿走 GPU 的背压：dataloader 以不受争用的速率运行，而 trainer 的 kernel launch 线程和 worker 进程之间的干扰（第 3 项里的 launch 间隙）在没有 kernel 被 launch 时就不存在。所以一个跟得上 benchmark 模式的 dataloader，不一定跟得上真实的训练 step。
 - benchmark 模式没有单独的结果表，它的应用例子见第 5 项：“仅空转（跳过计算）”的 run 就是跳过训练计算、单独测空转 kernel 自身的利用率和功耗（`OFU` 约 0%，功耗约 123 W）。
 
-**适用场景**：把 loader 吞吐从计算里隔离出来、把启动时间归因到阶段，或者测量某个诊断自身的开销；不用来给出最终数字，最终数字要用真实训练 step 的 `wall clock`（见第 2 项）。
+**适用场景**：把 dataloader 吞吐从计算里隔离出来、把启动时间归因到阶段，或者测量某个诊断自身的开销；不用来给出最终数字，最终数字要用真实训练 step 的 `wall clock`（见第 2 项）。
 
 ---
 

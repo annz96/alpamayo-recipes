@@ -13,7 +13,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 **Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
 - Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
 - NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training (see item 7)
-- Benchmark harness: skip the optimizer and measure the loader and startup time on their own (see item 8)
+- Benchmark harness: skip the optimizer and measure the dataloader and startup time on their own (see item 8)
 - Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples (see item 9)
 - Profiler: offline trace, down to modules and operators (see item 10)
 
@@ -22,7 +22,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 | Symptom | What it looks like | Metrics to look at |
 |---|---|---|
 | Training step slower than the hardware suggests, cause unknown | High device utilization (`sm%`) and normal loss, but the `wall clock` of each training step is longer than the hardware suggests | True `wall clock` / step; `arrival`, `forward`, `backward`, `host residual` (items 2 and 3; down to modules and operators in item 10) |
-| One rank slows down all ranks | The mean `wall clock` per training step is far above its median; periodic multi-second training steps, where some ranks are waiting for the batch while others are already waiting for gradient synchronization | `arrival` (i.e. data wait), `severe stall`, `stall gap`, `clean step` (item 1; measure the loader alone in item 8) |
+| One rank slows down all ranks | The mean `wall clock` per training step is far above its median; periodic multi-second training steps, where some ranks are waiting for the batch while others are already waiting for gradient synchronization | `arrival` (i.e. data wait), `severe stall`, `stall gap`, `clean step` (item 1; measure the dataloader alone in item 8) |
 | A fixed extra cost in every training step | The mean `wall clock` per training step is close to its median (no long tail), but both are above the reference configuration: every training step reliably costs a fixed extra amount | `forward`, `backward`, `host residual` (item 3; down to operators in item 10) |
 | GPU utilization near 100% but throughput low | Device utilization (`sm%`) near 100%, but `OFU` is low and power draw is close to idle | `MFU`, `HFU`, `OFU`, `HFU / OFU`, power; not device utilization (`sm%`) (item 5) |
 | Reported numbers disagree with the actual GPU-hour bill | The logged `iteration time` is below the true `wall clock`; or a cost estimated from the median is below the actual `GPU-hour` bill | True `wall clock` / step, `GPU-hour` (from the mean), compared against `iteration time` (items 2 and 4) |
@@ -35,14 +35,14 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 
 ![Left: one stage 2 training run with only job-level iteration time — median 1.254 s, mean 2.688 s, and the gap between them cannot be explained. Right (schematic): per-rank records separate each rank's wait for its batch (orange) from its compute time (blue), so the late-arriving rank 3 and the 2 s arrival spread used to define severe stall are directly visible.](assets/05_per_rank_step_telemetry_with_a_severe_stall_metric.png)
 
-In synchronous data-parallel training, the duration of a training step is set by the slowest rank. A job-level step time alone cannot tell the following apart: whether one rank is slow or all ranks are slow; whether data supply is insufficient (a few ranks receive their batch late, or the whole loader lags) or compute itself is slow (an abnormal or interfered node, or a global slowdown). Each case is handled differently, so the cause has to be located first.
+In synchronous data-parallel training, the duration of a training step is set by the slowest rank. A job-level step time alone cannot tell the following apart: whether one rank is slow or all ranks are slow; whether data supply is insufficient (a few ranks receive their batch late, or the whole dataloader lags) or compute itself is slow (an abnormal or interfered node, or a global slowdown). Each case is handled differently, so the cause has to be located first.
 At every training step each rank produces one record, which rank 0 gathers. Four quantities are derived from these records:
 - `instrument wall`: for each training step, the sum of a rank's `arrival` (time waiting for the batch) and `arrival-else` (time from receiving the batch to the end of the step, including H2D copy, forward, backward and gradient synchronization), maximized over ranks. This is the total time of the training step on the slowest rank (rank 3 in the figure).
 - `severe stall`: a training step in which the spread of `arrival` across ranks (maximum minus minimum, e.g. rank 3 versus rank 0 in the figure) exceeds 2 s, meaning some rank is waiting for data.
-- `clean step`: a training step whose maximum `arrival` is at most 0.1 s, meaning the loader caused no visible wait.
+- `clean step`: a training step whose maximum `arrival` is at most 0.1 s, meaning the dataloader caused no visible wait.
 - `stall gap`: the mean `instrument wall` over all training steps minus the mean `instrument wall` over `clean step`s, i.e. the extra time caused by stalls.
 
-The stall metric uses a difference rather than an absolute value: if one rank waits 11 s while the others wait only 0.1 s, the loader has a problem regardless of how long compute takes. The analysis should follow the rank that determines the step duration, not an average over ranks, and should report the mean, the median, the severe ratio, and the p95 / p99 of `arrival` together; these four correspond to four different failure shapes.
+The stall metric uses a difference rather than an absolute value: if one rank waits 11 s while the others wait only 0.1 s, the dataloader has a problem regardless of how long compute takes. The analysis should follow the rank that determines the step duration, not an average over ranks, and should report the mean, the median, the severe ratio, and the p95 / p99 of `arrival` together; these four correspond to four different failure shapes.
 
 **Implementation**:
 
@@ -68,8 +68,8 @@ Setup: 2B model, 16 nodes / 128 GPUs, 1,000-step benchmark; the metric is the `i
 
 | Configuration | `instrument wall` mean (s) | `instrument wall` median (s) | `severe stall` ratio | `arrival` p95 (s) | Verdict |
 |---|---:|---:|---:|---:|---|
-| Configuration A | 2.138 | 1.104 | 18.0% | 6.78 | Mean far above median and a high `severe stall` ratio: a long-tail latency problem; improve the loader's supply stability |
-| Configuration B | 1.576 | 1.556 | 0.0% | 0.29 | Mean close to median, no stalls: loader supply is stable; investigate compute and other overheads next (item 3, CUDA event decomposition) |
+| Configuration A | 2.138 | 1.104 | 18.0% | 6.78 | Mean far above median and a high `severe stall` ratio: a long-tail latency problem; improve the dataloader's supply stability |
+| Configuration B | 1.576 | 1.556 | 0.0% | 0.29 | Mean close to median, no stalls: dataloader supply is stable; investigate compute and other overheads next (item 3, CUDA event decomposition) |
 
 Notes:
 - Tables in this chapter use the `severe stall` definition (arrival spread across ranks > 2 s). Other material may use an `absolute stall` definition (slowest rank's wait > 5 s); state which one is used.
@@ -152,7 +152,7 @@ The telemetry of item 1 splits a training step into the wait (`arrival`) and `ar
 
 Approach: with per-rank telemetry enabled, the trainer wraps forward and backward with CUDA events (`torch.cuda.Event(enable_timing=True)`, timestamps taken by the GPU on its own stream). The time between two events **includes the gaps where the GPU waits for the CPU to submit the next kernel**, i.e. event interval = kernel time + launch gaps.
 
-On the rank that determines the step duration, a training step then splits into four segments: `arrival` (loader telemetry), `forward` and `backward` (events), and `host residual` (`arrival-else` − forward − backward, i.e. data movement, the optimizer's host-side cost, and the Python code between stages). How to read it: a longer `host residual` means the host code between stages got slower; a longer `forward` or `backward` while kernels and data have not changed can only be launch gaps, i.e. the CPU thread that submits kernels to the GPU is being interfered with.
+On the rank that determines the step duration, a training step then splits into four segments: `arrival` (dataloader telemetry), `forward` and `backward` (events), and `host residual` (`arrival-else` − forward − backward, i.e. data movement, the optimizer's host-side cost, and the Python code between stages). How to read it: a longer `host residual` means the host code between stages got slower; a longer `forward` or `backward` while kernels and data have not changed can only be launch gaps, i.e. the CPU thread that submits kernels to the GPU is being interfered with.
 
 **Implementation**:
 
@@ -173,7 +173,7 @@ Place one pair of events around forward and one pair around `loss.backward()`. F
 
 **Experiment data**: (internal data, for reference)
 
-Background: while optimizing the data loader, we found that besides `arrival` (waiting for the batch), `arrival-else` also got longer (in configuration B, `arrival-else` per training step increased markedly), and CUDA events were needed to find out which segment grew.
+Background: while optimizing the dataloader, we found that besides `arrival` (waiting for the batch), `arrival-else` also got longer (in configuration B, `arrival-else` per training step increased markedly), and CUDA events were needed to find out which segment grew.
 
 Purpose: find which segment holds the bottleneck from the decomposition, and thereby decide the optimization direction.
 
@@ -283,7 +283,7 @@ Validation (2B model, 1 node × 8 GPUs): with keep-alive on, the warm-up utiliza
 
 ![Flow diagram. Before: a merge leads straight to a long production run, and a regression is found only after that run has consumed a lot of GPU-hours. After: a merge triggers a scheduled three-leg run (checkpoint resume check, a pinned full run at 16 nodes / global batch 512 / 10,000 steps, and a comparison against bands set from a 100k-step reference run), which alerts before the next long run starts.](assets/05_a_fixed_reference_run_with_regression_bands.png)
 
-After a change to the training code (trainer, loader, kernels or environment), a stable experiment should be run periodically to check that the change has not hurt system efficiency or loss. As shown in the figure, the experiment has two steps: first a system checkpoint resume check (resume from a mid-run checkpoint and re-run the second half, to verify that the resume is correct), then a system efficiency check (a full run of a fixed recipe, configured as in production). In addition, we maintain a set of baseline system-efficiency and loss metrics as thresholds, called "bands" (the allowed range of each metric, derived from a known-good reference run); after the full run finishes it is judged against the bands, and an alert is raised when a band is exceeded (the third leg in the figure). This catches problems before the next long run starts and avoids wasting training resources.
+After a change to the training code (trainer, dataloader, kernels or environment), a stable experiment should be run periodically to check that the change has not hurt system efficiency or loss. As shown in the figure, the experiment has two steps: first a system checkpoint resume check (resume from a mid-run checkpoint and re-run the second half, to verify that the resume is correct), then a system efficiency check (a full run of a fixed recipe, configured as in production). In addition, we maintain a set of baseline system-efficiency and loss metrics as thresholds, called "bands" (the allowed range of each metric, derived from a known-good reference run); after the full run finishes it is judged against the bands, and an alert is raised when a band is exceeded (the third leg in the figure). This catches problems before the next long run starts and avoids wasting training resources.
 
 **Implementation**:
 
@@ -319,7 +319,7 @@ Baseline experiment: 2B model, stage 1, 16 nodes, global batch 512.
 Notes:
 - Why the band on `iteration time` uses the median: on variable multimodal shapes, recompiles hit fewer than 0.5% of training steps but cost 10~575 s each. On a 10k-step run the mean was 3.646 s and the p95 2.40 s, while the median was 2.005 s; across two identical 3,000-step runs the p95 swung between 2.40 and 4.01 s while the median held at 2.00~2.01 s. The median is therefore the stable criterion, while the mean is still used for cost (see item 4).
 
-**When to use**: after every change that touches the trainer, the loader, the kernels or the environment, run these two experiments periodically at the production topology to keep the training system stable and efficient.
+**When to use**: after every change that touches the trainer, the dataloader, the kernels or the environment, run these two experiments periodically at the production topology to keep the training system stable and efficient.
 
 ---
 
@@ -443,14 +443,14 @@ Notes:
 
 ---
 
-## 8. Benchmark harness: skip the optimizer and measure the loader and startup time on their own
+## 8. Benchmark harness: skip the optimizer and measure the dataloader and startup time on their own
 
 **Idea**:
 
 ![Two panels. Left: a full training step (loader wait, forward / backward, optimizer) above a skip_compute training step reduced to "loader delivery + a dummy step" (schematic). Right: a 79.23 s startup wall-clock total above its phase breakdown, with dataset instantiation at 71.42 s (90.1%).](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
 
-When optimizing the loader, to see how much faster it really got, the data time has to be separated from the training step. The reason is that the loader workers prefetch the next batch in the background, in parallel with the current step's compute: as long as the loader is faster than the compute, its time is hidden by the compute, and a full training step only exposes the part that is not hidden (the loader wait at the top left of the figure), so an improvement cannot be seen. So we build a harness that runs only the stage of interest and does not change the production code path:
-- the trainer's benchmark mode: a config switch makes the trainer skip forward / backward, gradient clipping and the optimizer step, and keep only the data path (dataset, packer, H2D copy). With no compute left to hide the loader, the measured training-step time is the full delivery rate of the data path (bottom left of the figure), and the cost of other diagnostics can also be measured alone; the keep-alive cost in item 5 was measured this way;
+When optimizing the dataloader, to see how much faster it really got, the data time has to be separated from the training step. The reason is that the dataloader workers prefetch the next batch in the background, in parallel with the current step's compute: as long as the dataloader is faster than the compute, its time is hidden by the compute, and a full training step only exposes the part that is not hidden (the loader wait at the top left of the figure), so an improvement cannot be seen. So we build a harness that runs only the stage of interest and does not change the production code path:
+- the trainer's benchmark mode: a config switch makes the trainer skip forward / backward, gradient clipping and the optimizer step, and keep only the data path (dataset, packer, H2D copy). With no compute left to hide the dataloader, the measured training-step time is the full delivery rate of the data path (bottom left of the figure), and the cost of other diagnostics can also be measured alone; the keep-alive cost in item 5 was measured this way;
 - the startup harness: startup time is the same story. For a mixture of dozens of datasets, constructing the datasets alone can take more than a minute, and a single wall-clock total (top right of the figure) does not show which phase is slow. The harness constructs the training input the way production does (configuration composition, dataset construction, mixture sampler setup, first batch) and times each phase (bottom right of the figure). It calls the production constructors rather than a copy, so it evolves with the code.
 
 **Implementation**:
@@ -504,10 +504,10 @@ The table below shows the result of the startup harness: startup time can be bro
 
 Notes:
 - Nine tenths of startup is dataset construction; the harness records the phase for every child dataset, so the next question (which dataset, which phase) can be answered from the same result.
-- Skipping compute removes GPU back-pressure: the loader runs at its uncontended rate, and the interference between the trainer's kernel-launch thread and the worker processes (the launch gaps in item 3) does not exist when no kernels are launched. A loader that keeps up with the benchmark mode therefore may not keep up with a real training step.
+- Skipping compute removes GPU back-pressure: the dataloader runs at its uncontended rate, and the interference between the trainer's kernel-launch thread and the worker processes (the launch gaps in item 3) does not exist when no kernels are launched. A dataloader that keeps up with the benchmark mode therefore may not keep up with a real training step.
 - The benchmark mode has no result table of its own; an application is in item 5: the "spin only (compute skipped)" run skips the training compute to measure the utilization and power of the spin kernel alone (`OFU` about 0%, power about 123 W).
 
-**When to use**: isolating loader throughput from compute, attributing startup time to phases, or measuring the cost of a diagnostic itself; not for giving the final number, which should be the `wall clock` of the real training step (see item 2).
+**When to use**: isolating dataloader throughput from compute, attributing startup time to phases, or measuring the cost of a diagnostic itself; not for giving the final number, which should be the `wall clock` of the real training step (see item 2).
 
 ---
 
