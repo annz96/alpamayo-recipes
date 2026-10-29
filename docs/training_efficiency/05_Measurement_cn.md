@@ -492,7 +492,7 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 
 **实验数据**:(内部数据供参考)
 
-启动拆解（2B 模型 stage 1 配置，37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数）：
+下表为启动 harness 的结果，说明启动时间可以拆到各个阶段，从而知道该优化哪里。启动拆解（2B 模型 stage 1 配置，37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数）：
 
 | 阶段 | 时间 | 占比 |
 |---|---:|---:|
@@ -505,6 +505,7 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 说明：
 - 启动耗时的九成是数据集构造；harness 为每个子数据集记录阶段，所以下一个问题（哪个数据集、哪个阶段）可以从同一份结果里回答。
 - 跳过计算会拿走 GPU 的背压：loader 以不受争用的速率运行，而 trainer 的 kernel launch 线程和 worker 进程之间的干扰（第 3 项里的 launch 间隙）在没有 kernel 被 launch 时就不存在。所以一个跟得上 benchmark 模式的 loader，不一定跟得上真实的训练 step。
+- benchmark 模式没有单独的结果表，它的应用例子见第 5 项：“仅空转（跳过计算）”的 run 就是跳过训练计算、单独测空转 kernel 自身的利用率和功耗（`OFU` 约 0%，功耗约 123 W）。
 
 **适用场景**：把 loader 吞吐从计算里隔离出来、把启动时间归因到阶段，或者测量某个诊断自身的开销；不用来给出最终数字，最终数字要用真实训练 step 的 `wall clock`（见第 2 项）。
 

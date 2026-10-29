@@ -494,7 +494,7 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # times each 
 
 **Experiment data**: (internal data, for reference)
 
-Startup breakdown (2B model, stage 1 configuration, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time):
+The table below shows the result of the startup harness: startup time can be broken down by phase, which shows where to optimize. Startup breakdown (2B model, stage 1 configuration, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time):
 
 | Phase | Time | Share |
 |---|---:|---:|
@@ -507,6 +507,7 @@ Startup breakdown (2B model, stage 1 configuration, 37 child datasets, batch 2, 
 Notes:
 - Nine tenths of startup is dataset construction; the harness records the phase for every child dataset, so the next question (which dataset, which phase) can be answered from the same result.
 - Skipping compute removes GPU back-pressure: the loader runs at its uncontended rate, and the interference between the trainer's kernel-launch thread and the worker processes (the launch gaps in item 3) does not exist when no kernels are launched. A loader that keeps up with the benchmark mode therefore may not keep up with a real training step.
+- The benchmark mode has no result table of its own; an application is in item 5: the "spin only (compute skipped)" run skips the training compute to measure the utilization and power of the spin kernel alone (`OFU` about 0%, power about 123 W).
 
 **When to use**: isolating loader throughput from compute, attributing startup time to phases, or measuring the cost of a diagnostic itself; not for giving the final number, which should be the `wall clock` of the real training step (see item 2).
 
