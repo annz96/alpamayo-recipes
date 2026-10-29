@@ -13,7 +13,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 **Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
 - Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
 - NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training (see item 7)
-- Benchmark harness: skip the optimizer and measure the dataloader and startup time on their own (see item 8)
+- Dataloader harness: skip the compute to measure the dataloader's delivery rate on its own, and break the startup time down by phase (see item 8)
 - Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples (see item 9)
 - Profiler: offline trace, down to modules and operators (see item 10)
 
@@ -443,19 +443,19 @@ Notes:
 
 ---
 
-## 8. Benchmark harness: skip the optimizer and measure the dataloader and startup time on their own
+## 8. Dataloader harness: skip the compute to measure the dataloader's delivery rate on its own, and break the startup time down by phase
 
 **Idea**:
 
 ![Two panels. Left: a full training step (loader wait, forward / backward, optimizer) above a skip_compute training step reduced to "loader delivery + a dummy step" (schematic). Right: a 79.23 s startup wall-clock total above its phase breakdown, with dataset instantiation at 71.42 s (90.1%).](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
 
-When optimizing the dataloader, to see how much faster it really got, the data time has to be separated from the training step. The reason is that the dataloader workers prefetch the next batch in the background, in parallel with the current step's compute: as long as the dataloader is faster than the compute, its time is hidden by the compute, and a full training step only exposes the part that is not hidden (the loader wait at the top left of the figure), so an improvement cannot be seen. So we build a harness that runs only the stage of interest and does not change the production code path:
-- the trainer's benchmark mode: a config switch makes the trainer skip forward / backward, gradient clipping and the optimizer step, and keep only the data path (dataset, packer, H2D copy). With no compute left to hide the dataloader, the measured training-step time is the full delivery rate of the data path (bottom left of the figure), and the cost of other diagnostics can also be measured alone; the keep-alive cost in item 5 was measured this way;
-- the startup harness: startup time is the same story. For a mixture of dozens of datasets, constructing the datasets alone can take more than a minute, and a single wall-clock total (top right of the figure) does not show which phase is slow. The harness constructs the training input the way production does (configuration composition, dataset construction, mixture sampler setup, first batch) and times each phase (bottom right of the figure). It calls the production constructors rather than a copy, so it evolves with the code.
+When optimizing the dataloader, to see how much faster it really got, the data time has to be separated from the training step. The reason is that the dataloader workers prefetch the next batch in the background, in parallel with the current step's compute: as long as the dataloader is faster than the compute, its time is hidden by the compute, and a full training step only exposes the part that is not hidden (the loader wait at the top left of the figure), so an improvement cannot be seen. So we build a dataloader harness that runs only the stage of interest and does not change the production code path, with two parts:
+- benchmark mode (compute skipped): only the data path is kept, so the measured training-step time is the full time of the data processing (bottom left of the figure);
+- the startup harness: breaks the startup time down by phase and shows each phase's share of the overhead (bottom right of the figure).
 
 **Implementation**:
 
-The trainer's benchmark mode (excerpted from the internal implementation, with logging and placeholder-loss details omitted):
+Benchmark mode (compute skipped; excerpted from the internal implementation):
 
 ```python
 # config: [custom.benchmark] skip_compute = true
@@ -492,7 +492,9 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # times each 
 
 **Experiment data**: (internal data, for reference)
 
-The table below shows the result of the startup harness: startup time can be broken down by phase, which shows where to optimize. Startup breakdown (2B model, stage 1 configuration, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time):
+The table below shows the result of the startup harness, which can be used to analyze the overhead of each phase of the dataloader's startup and so shows where to optimize.
+
+Configuration: 2B model, stage 1, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time:
 
 | Phase | Time | Share |
 |---|---:|---:|
@@ -503,11 +505,10 @@ The table below shows the result of the startup harness: startup time can be bro
 | First batch | 0.0004 s | about 0% |
 
 Notes:
-- Nine tenths of startup is dataset construction; the harness records the phase for every child dataset, so the next question (which dataset, which phase) can be answered from the same result.
+- Nine tenths of the startup time is dataset instantiation.
 - The benchmark mode measures the best case for the dataloader: with compute skipped, no kernels need to be launched, so the trainer's CPU thread no longer competes with the dataloader worker processes for CPU (the extra 0.28 s in `forward` in item 3 was caused by exactly this competition), and the dataloader runs undisturbed. A dataloader that keeps up in the benchmark mode may therefore slow down in real training because of CPU contention, so the final conclusion must rest on the real training step.
-- The benchmark mode has no result table of its own; an application is in item 5: the "spin only (compute skipped)" run skips the training compute to measure the utilization and power of the spin kernel alone (`OFU` about 0%, power about 123 W).
 
-**When to use**: isolating dataloader throughput from compute, attributing startup time to phases, or measuring the cost of a diagnostic itself; not for giving the final number, which should be the `wall clock` of the real training step (see item 2).
+**When to use**: when optimizing the dataloader, to analyze the dataloader's throughput separately from the compute, and to attribute the startup time to phases.
 
 ---
 
