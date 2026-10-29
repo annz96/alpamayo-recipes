@@ -447,11 +447,9 @@ for backend in (SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
 
 ![两个面板。左：完整训练 step（loader 等待、forward / backward、optimizer）在上，skip_compute 的训练 step 被缩成“loader 交付 + 一个 dummy step”（示意）。右：79.23 s 的启动 wall clock 总数在上，其阶段拆解在下，dataset 实例化 71.42 s（90.1%）。](assets/05_benchmark_harnesses_that_skip_the_optimizer_step.png)
 
-**解决的问题**：优化 loader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来，否则会被 optimizer、集体通信等开销掩盖。启动时间则要拆到每个阶段，才知道慢在哪：由几十个数据集组成的混合，构造数据集就可能超过一分钟，一个 wall clock 总数看不出哪个阶段慢。
-
-**思路**：做一个只跑目标阶段、不改动生产代码路径的 harness：
-- trainer 的 benchmark 模式：配置里一个开关让 trainer 跳过 forward / backward、梯度裁剪和 optimizer step，只保留数据路径（数据集、packer、H2D 拷贝）。这时测得的训练 step 时间就是数据路径的交付速率，其他诊断的开销也可以单独测，第 5 项里 keep-alive 的开销就是这样测的；
-- 启动 harness：按生产的方式构造训练输入（配置组装、数据集构造、混合 sampler 设置、第一个 batch），给每个阶段计时。它调用的是生产的构造器而不是一份拷贝，所以会随代码一起演化。
+优化 loader 时，要看它到底快了多少，需要把数据的耗时从训练 step 里独立出来。原因是 loader 的 worker 在后台预取下一个 batch，和当前 step 的计算并行：只要 loader 比计算快，它的耗时就被计算盖住，完整训练里只会露出没被盖住的那部分等待（图左上的 loader wait），改进看不出来。所以做一个只跑目标阶段、不改动生产代码路径的 harness：
+- trainer 的 benchmark 模式：配置里一个开关让 trainer 跳过 forward / backward、梯度裁剪和 optimizer step，只保留数据路径（数据集、packer、H2D 拷贝）。这时没有计算可以盖住 loader，测得的训练 step 时间就是数据路径完整的交付速率（图左下），其他诊断的开销也可以单独测，第 5 项里 keep-alive 的开销就是这样测的；
+- 启动 harness：启动时间也一样，由几十个数据集组成的混合，构造数据集就可能超过一分钟，而一个 wall clock 总数（图右上）看不出哪个阶段慢。harness 按生产的方式构造训练输入（配置组装、数据集构造、混合 sampler 设置、第一个 batch），给每个阶段计时（图右下）。它调用的是生产的构造器而不是一份拷贝，所以会随代码一起演化。
 
 **实现**:
 
