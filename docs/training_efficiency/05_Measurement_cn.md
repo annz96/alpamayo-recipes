@@ -500,6 +500,8 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 | sampler 设置 | 1.546 s | 2.0% |
 | 第一个 batch | 0.0004 s | 约 0% |
 
+说明：benchmark mode 没有 compute，dataloader 不受 CPU 争抢，测得的是最好情况，真实训练里可能更慢，最终结论以真实训练 step 为准。
+
 **适用场景**：优化 dataloader 时，把 dataloader 的吞吐从计算里隔离出来单独分析，并把启动时间归因到各个阶段。
 
 ---

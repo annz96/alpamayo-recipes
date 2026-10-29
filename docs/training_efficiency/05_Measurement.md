@@ -502,6 +502,8 @@ The result of the startup harness, used to analyze the overhead of each phase of
 | Sampler setup | 1.546 s | 2.0% |
 | First batch | 0.0004 s | about 0% |
 
+Note: benchmark mode has no compute, so the dataloader does not compete for CPU and the result is the best case; it may be slower in real training, so the final conclusion should rest on the real training step.
+
 **When to use**: when optimizing the dataloader, to analyze the dataloader's throughput separately from the compute, and to attribute the startup time to phases.
 
 ---
