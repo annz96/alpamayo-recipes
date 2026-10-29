@@ -13,7 +13,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 **Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
 - Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
 - NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training (see item 7)
-- Dataloader harness: skip the compute to measure the dataloader's delivery rate on its own, and break the startup time down by phase (see item 8)
+- Dataloader harness: skip the compute to measure the dataloader's time on its own, and break the startup time down by phase (see item 8)
 - Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples (see item 9)
 - Profiler: offline trace, down to modules and operators (see item 10)
 
@@ -443,7 +443,7 @@ Notes:
 
 ---
 
-## 8. Dataloader harness: skip the compute to measure the dataloader's delivery rate on its own, and break the startup time down by phase
+## 8. Dataloader harness: skip the compute to measure the dataloader's time on its own, and break the startup time down by phase
 
 **Idea**:
 
@@ -492,9 +492,7 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # times each 
 
 **Experiment data**: (internal data, for reference)
 
-The table below shows the result of the startup harness, which can be used to analyze the overhead of each phase of the dataloader's startup and so shows where to optimize.
-
-Configuration: 2B model, stage 1, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time:
+The result of the startup harness, used to analyze the overhead of each phase of the dataloader's startup and so show where to optimize. Configuration: 2B model, stage 1, 37 child datasets, batch 2, 10 workers, world size 8, single node; median phase wall time:
 
 | Phase | Time | Share |
 |---|---:|---:|
@@ -503,10 +501,6 @@ Configuration: 2B model, stage 1, 37 child datasets, batch 2, 10 workers, world 
 | Configuration composition (Hydra) | 6.263 s | 7.9% |
 | Sampler setup | 1.546 s | 2.0% |
 | First batch | 0.0004 s | about 0% |
-
-Notes:
-- Nine tenths of the startup time is dataset instantiation.
-- The benchmark mode measures the best case for the dataloader: with compute skipped, no kernels need to be launched, so the trainer's CPU thread no longer competes with the dataloader worker processes for CPU (the extra 0.28 s in `forward` in item 3 was caused by exactly this competition), and the dataloader runs undisturbed. A dataloader that keeps up in the benchmark mode may therefore slow down in real training because of CPU contention, so the final conclusion must rest on the real training step.
 
 **When to use**: when optimizing the dataloader, to analyze the dataloader's throughput separately from the compute, and to attribute the startup time to phases.
 

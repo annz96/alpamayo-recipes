@@ -13,7 +13,7 @@
 **持续监控与辅助方法**:训练中的持续记录与回归监控,以及单独测量某一段的方法（第 6~10 项持续补充中）
 - 回归测试: 代码改动后定期跑固定配方,与基线阈值（带）对比,超出就报警 (见第 6 项)
 - NaN / inf 梯度取证: 出现时保存现场用于复现和定位,平时不拖慢训练 (见第 7 项)
-- dataloader harness: 跳过计算单独量 dataloader 交付速率,并把启动时间拆到各阶段 (见第 8 项)
+- dataloader harness: 跳过 compute 单独计算 dataloader 耗时,并把启动时间拆到各阶段 (见第 8 项)
 - 分项 loss 与截断日志: 各项 loss 分开记,截断样本留身份 (见第 9 项)
 - profiler: 离线 trace,细到模块和算子 (见第 10 项)
 
@@ -441,7 +441,7 @@ for backend in (SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH):
 
 ---
 
-## 8. dataloader harness: 跳过计算单独量 dataloader 交付速率,并把启动时间拆到各阶段
+## 8. dataloader harness: 跳过 compute 单独计算 dataloader 耗时,并把启动时间拆到各阶段
 
 **思路**:
 
@@ -490,9 +490,7 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 
 **实验数据**:(内部数据供参考)
 
-下表为启动 harness 的结果，可用来分析 dataloader 启动各阶段的开销，从而知道该优化哪里。
-
-配置：2B 模型 stage 1，37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数：
+启动 harness 的结果，用来分析 dataloader 启动各阶段的开销，从而知道该优化哪里。配置：2B 模型 stage 1，37 个子数据集，batch 2，10 个 worker，world size 8，单节点；各阶段 wall time 取中位数：
 
 | 阶段 | 时间 | 占比 |
 |---|---:|---:|
@@ -501,10 +499,6 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 | 配置组装（Hydra） | 6.263 s | 7.9% |
 | sampler 设置 | 1.546 s | 2.0% |
 | 第一个 batch | 0.0004 s | 约 0% |
-
-说明：
-- 启动耗时的九成是 dataset 实例化。
-- benchmark 模式测得的是 dataloader 的最好情况：跳过计算后没有 kernel 需要 launch，trainer 的 CPU 线程不再和 dataloader 的 worker 进程争抢 CPU（第 3 项里 `forward` 多出的 0.28 s 就是这种争抢造成的），dataloader 以不受干扰的速率运行。所以一个在 benchmark 模式下跟得上的 dataloader，在真实训练里可能因为 CPU 争用而变慢，最终结论要以真实训练 step 为准。
 
 **适用场景**：优化 dataloader 时，把 dataloader 的吞吐从计算里隔离出来单独分析，并把启动时间归因到各个阶段。
 
