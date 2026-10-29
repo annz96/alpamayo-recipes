@@ -230,7 +230,7 @@ Setup: for a 2B model, `GPU-hour` and end-to-end time per 100k steps computed by
 
 **Idea**:
 
-![Dumbbell chart for three runs: device utilization is 62%~100% while OFU is only 0~14%; the pure-spin run reads about 100% utilization at idle power with OFU about 0%.](assets/05_mfu_hfu_and_ofu_versus_device_utilization.png)
+![Dumbbell chart for two runs: device utilization is 62%~100% while OFU is only 0~14%; the pure-spin run reads about 100% utilization at idle power with OFU about 0%.](assets/05_mfu_hfu_and_ofu_versus_device_utilization.png)
 
 The "utilization" reported by device monitoring (`sm%` in `nvidia-smi`) is **occupancy**: the fraction of the sampling period during which any kernel was resident on the device. It does not reflect how much of the hardware peak the resident work uses; a spin kernel (a kernel that does no useful compute and only occupies the GPU, such as `torch.cuda._sleep`) reads about 100% even at idle power. The following three metrics tie "actual work efficiency" to "hardware peak capability":
 - `MFU` (model FLOP utilization): the useful floating-point work the model needs per training step, divided by time and the hardware peak. The work is estimated with the 6N convention (forward + backward cost about 6×N operations per token, N being the parameter count). The hardware peak comes in a sparse and a dense flavor; only an `MFU` computed against the dense peak is comparable with MFU in the published literature.
@@ -252,28 +252,14 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 
 **Experiment data**: (internal data, for reference)
 
-Three runs are compared (2B model, 1 node, `iteration time` definition): spin only (training compute skipped, only spin kernels run), real training (no spin), and real training plus continuous spin (spin kernels run throughout training). Utilization (`sm%`) is not actual compute utilization (`OFU`): spinning pushes the utilization reading close to 100% but `OFU` does not rise, and `iteration time` actually gets slower (about 5% worse on 1 node, about 14% worse on 4 nodes).
+Two runs are compared (2B model, 1 node, `iteration time` definition): spin only (training compute skipped, only spin kernels run) and real training. Utilization (`sm%`) is not actual compute utilization (`OFU`): the spin-only run reads close to 100% utilization, but its `OFU` is about 0% and its power draw is only at the idle level.
 
 | Run | Utilization (`sm%`) | `OFU` | `iteration time` | Power |
 |---|---:|---:|---:|---:|
 | Spin only (compute skipped) | about 100% | about 0% | n/a | about 123 W (idle) |
 | Real training | 62% / 87% (median) | 14.1% | 1.46 s | 415 W |
-| Real training + continuous spin | about 98% | 13.5% | 1.54 s | 389 W |
 
-**When to use**: comparing configurations across model sizes or topologies, and judging whether a GPU-bound configuration still has headroom. Use `OFU`, `MFU` and power to decide, never device utilization; spinning should only be used during warm-up.
-
-**Extension: keeping a job from being killed by an idle-GPU reaper (the keep-alive used in Alpamayo training)**
-
-Some clusters terminate jobs whose GPUs show no activity for a long time (an idle-GPU reaper), while the first minutes after a job starts (initialization, checkpoint loading, compilation, ...) naturally have near-zero utilization, so a job can be killed before its first training step. Alpamayo training uses a keep-alive to avoid this: it keeps the GPU "active" during warm-up. It is not needed on clusters without such a policy.
-- **How**: during warm-up, spin on a dedicated stream with `torch.cuda._sleep` pulses of about 50 ms; switch to a dormant state at the first training step; stop at the last step.
-- **It must go dormant**: a resident spin kernel cannot be preempted by an all-reduce, so continuous spinning slows the training step, and the cost grows with node count. Keep-alive only satisfies the reaper's check and must not be used as evidence of efficiency.
-
-Validation (2B model, 1 node × 8 GPUs): with keep-alive on, the warm-up utilization reading rises from 16% (median 0%) to 88% (median 100%), power is unchanged, and the steady-state `iteration time` is unchanged. This comparison only validates the mechanism and cost of keep-alive; it does not show a performance gain.
-
-| Configuration | Warm-up `sm%` mean / median | Warm-up power | Steady-state `iteration time` mean (s) |
-|---|---:|---:|---:|
-| keep-alive on (default) | 88% / 100% | 132 W | 1.600 |
-| keep-alive off (reference) | 16% / 0% | 135 W | 1.593 |
+**When to use**: comparing configurations across model sizes or topologies, and judging whether a GPU-bound configuration still has headroom. Use `OFU`, `MFU` and power to decide, never device utilization.
 
 ---
 

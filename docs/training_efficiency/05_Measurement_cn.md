@@ -230,7 +230,7 @@ e2e_days_per_100k  = mean_wall_s_per_step * 100_000 / 86_400
 
 **思路**:
 
-![三个 run 的哑铃图：设备利用率为 62%~100%，而 OFU 仅为 0~14%；纯空转（spin）的 run 在空闲功耗下读到约 100% 的利用率，OFU 约为 0%。](assets/05_mfu_hfu_and_ofu_versus_device_utilization.png)
+![两个 run 的哑铃图：设备利用率为 62%~100%，而 OFU 仅为 0~14%；纯空转（spin）的 run 在空闲功耗下读到约 100% 的利用率，OFU 约为 0%。](assets/05_mfu_hfu_and_ofu_versus_device_utilization.png)
 
 设备监控给出的“利用率”（`nvidia-smi` 的 `sm%`）是**占用率**：采样周期内有任意 kernel 驻留在设备上的比例。它不反映驻留的工作用了多少硬件峰值，一个空转的 kernel（不做有用计算、只占用 GPU 的 kernel，如 `torch.cuda._sleep`）在空闲功耗下也会读到约 100%。以下三个指标把“实际工作效率”与“硬件峰值能力”联系起来：
 - `MFU`（model FLOP utilization）：模型每个训练 step 需要的有用浮点运算量，除以耗时和硬件峰值。运算量按 6N 约定估算（forward + backward 每个 token 约 6×N 次运算，N 为参数量）。硬件峰值有带稀疏和稠密（dense）两种口径，只有以稠密峰值计算的 `MFU` 可与公开文献中的 MFU 比较。
@@ -252,28 +252,14 @@ def flop_utilization(params, tokens_per_step, step_time_s, peak_flops_per_gpu, n
 
 **实验数据**:(内部数据供参考)
 
-对比三种 run（2B 模型，1 节点，`iteration time` 口径）：仅空转（跳过训练计算，只运行空转 kernel）、真实训练（不空转）、真实训练加持续空转（训练的同时一直运行空转 kernel）。可以发现，利用率（`sm%`）不等于实际算力利用率（`OFU`）：空转能把利用率读数提高到接近 100%，但 `OFU` 没有提高，`iteration time` 反而变慢（1 节点退步约 5%，4 节点退步约 14%）。
+对比两种 run（2B 模型，1 节点，`iteration time` 口径）：仅空转（跳过训练计算，只运行空转 kernel）和真实训练。可以发现，利用率（`sm%`）不等于实际算力利用率（`OFU`）：仅空转的 run 利用率读数接近 100%，但 `OFU` 约为 0%，功耗也只有空闲水平。
 
 | run | 利用率 (`sm%`) | `OFU` | `iteration time` | 功耗 |
 |---|---:|---:|---:|---:|
 | 仅空转（跳过计算） | 约 100% | 约 0% | 不适用 | 约 123 W（空闲） |
 | 真实训练 | 62% / 87%（中位） | 14.1% | 1.46 s | 415 W |
-| 真实训练 + 持续空转 | 约 98% | 13.5% | 1.54 s | 389 W |
 
-**适用场景**：跨模型规模或 topology 比较配置，以及判断某个 GPU-bound 的配置是否仍有提升空间。应使用 `OFU`、`MFU` 和功耗来判断，不应使用设备利用率；空转只应用于 warm-up 期间。
-
-**延伸：避免 job 被空闲 GPU 回收器误终止（Alpamayo 训练中的 keep-alive 做法）**
-
-部分集群会终止 GPU 长时间没有活动的 job（空闲 GPU 回收器），而 job 启动后的几分钟（初始化、加载 checkpoint、编译等）利用率本来就接近零，可能在第一个训练 step 之前就被终止。Alpamayo 训练中采用 keep-alive 来避免这种情况：在 warm-up 期间让 GPU 保持“有活动”。集群没有这类回收策略时不需要。
-- **做法**：warm-up 期间在专用 stream 上以约 50 ms 的 `torch.cuda._sleep` 脉冲空转；第一个训练 step 时切换到休眠状态；最后一步停止。
-- **必须休眠**：常驻的空转 kernel 不能被 all-reduce 抢占，持续空转会使训练 step 变慢，代价随节点数增长。keep-alive 只用于满足回收器的判断，不应作为效率的证据。
-
-验证（2B 模型1 节点 × 8 GPU）：开启 keep-alive 后，warm-up 阶段的利用率读数由 16%（中位数 0%）升至 88%（中位数 100%），功耗不变，稳态 `iteration time` 不变。这个对比只验证 keep-alive 的机制和代价，不涉及性能收益。
-
-| 配置 | warm-up `sm%` 均值 / 中位数 | warm-up 功耗 | 稳态 `iteration time` 均值 (s) |
-|---|---:|---:|---:|
-| keep-alive 开（默认） | 88% / 100% | 132 W | 1.600 |
-| keep-alive 关（对照） | 16% / 0% | 135 W | 1.593 |
+**适用场景**：跨模型规模或 topology 比较配置，以及判断某个 GPU-bound 的配置是否仍有提升空间。应使用 `OFU`、`MFU` 和功耗来判断，不应使用设备利用率。
 
 ---
 
