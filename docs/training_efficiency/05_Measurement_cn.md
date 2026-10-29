@@ -10,12 +10,12 @@
 - `GPU-hour`: 用 `wall clock` 均值算,不用中位数 (见第 4 项)
 - `MFU / HFU / OFU`: 看实际算力利用,不看设备利用率 (见第 5 项)
 
-**持续监控与辅助方法**:训练中的持续记录与回归监控,以及单独测量某一段的方法（第 6~10 项持续补充中）
+**持续监控与辅助方法**:训练中的持续记录与回归监控,以及单独测量某一段的方法（第 6~10 项）
 - 回归测试: 代码改动后定期跑固定配方,与基线阈值（带）对比,超出就报警 (见第 6 项)
 - NaN / inf 梯度取证: 出现时保存现场用于复现和定位,平时不拖慢训练 (见第 7 项)
 - dataloader harness: 跳过 compute 单独计算 dataloader 耗时,并把启动时间拆到各阶段 (见第 8 项)
 - 训练日志增强: 细化多模态训练 loss,定位异常输入样本 (见第 9 项)
-- profiler: 离线 trace,细到模块和算子 (见第 10 项)
+- 开启 torch.profiler: 细化模块和算子开销 (见第 10 项)
 
 **问题定位**:遇到具体症状时,看对应的指标和瓶颈定位:
 
@@ -552,6 +552,53 @@ if n_tokens > max_len:
 
 ---
 
-## 10. profiler: 离线 trace,细到模块和算子
+## 10. 开启 torch.profiler: 细化模块和算子开销
 
-待补充。
+**思路**:
+
+![同一毫秒刻度上的四条训练 step 时间线：一根不透明的 1087 ms 训练 step 计时条；同一个训练 step 被 profiler trace 拆成未 pin 的 H2D 拷贝、一次 `torch.linalg.solve` 调用和其余部分；`pin_memory` 之后 972 ms；去掉 solve 之后 949 ms，回收约 140 ms。](assets/05_trainer_profiler_for_an_offline_step_breakdown.png)
+
+逐 step 观测 step time 只能定位到训练 step 的哪一段慢，要知道具体是哪个模块、哪个算子，需要更细的粒度。借助 PyTorch 自带的 `torch.profiler`，给训练 step 的各阶段打上标签，离线读 trace 来定位可优化的部分。
+
+**实现**:
+
+打开 `trainer.enable_profiler` 开关（默认关闭），即在训练 step 周围启用 `torch.profiler`。结果保存在输出目录的 `profiler/` 下，有两类：trace（用 tensorboard 查看，`tensorboard --logdir=<输出目录>/profiler/`）；GPU 显存随时间的分布（html，按模型参数、激活、optimizer 状态等分组）。伪代码：
+
+```python
+# 开关：trainer.enable_profiler = true（默认 false）
+if config.enable_profiler:
+    profiler = torch.profiler.profile(
+        activities=[CPU, CUDA],
+        schedule=schedule(skip_first=1, wait=5, warmup=1, active=3),   # 跳过前几步，只记录 3 个训练 step
+        record_shapes=True, profile_memory=True, with_stack=True,
+        on_trace_ready=trace_handler(output_dir / "profiler"),         # 保存 trace，并导出 GPU 显存随时间的分布
+    )
+    profiler.start()
+
+for step in range(max_iter):
+    with record_function("training_step"):    loss = model.training_step(batch)    # 给各阶段打标签，
+    with record_function("backward"):         loss.backward()                      # trace 里可以按阶段归因
+    with record_function("optimizer step"):   optimizer.step(); scheduler.step()
+    if config.enable_profiler:
+        profiler.step()                                                            # 每个训练 step 结束时推进 profiler
+
+if config.enable_profiler:
+    profiler.stop()
+```
+
+**实验数据**:(内部数据供参考)
+
+一次 profiler 采集的 trace，就可以把 forward 拆解到各个组件，也能定位到具体的算子开销。
+
+| 组件 | forward 耗时 |
+|---|---:|
+| 视频 tokenizer | 105 ms |
+| 轨迹 tokenizer | 1 ms |
+| 历史 tokenizer | 1 ms |
+| 路线模型 | 42 ms |
+| 语言模型 | 235 ms |
+
+根据 trace 定位并修复了两处算子开销（未 pin 的 H2D 拷贝、一次 `torch.linalg.solve` 调用），两处修复合计，每个训练 step 回收约 140 ms。
+
+**适用场景**：已经定位到训练 step 的某一段偏慢，需要进一步归因到具体的模块或算子时。
+

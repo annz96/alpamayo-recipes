@@ -10,12 +10,12 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 - `GPU-hour`: compute it from the mean `wall clock`, never the median (see item 4)
 - `MFU / HFU / OFU`: look at actual compute utilization, not device utilization (see item 5)
 
-**Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10 are still being added)
+**Continuous monitoring and supporting methods**: continuous recording and regression monitoring during training, plus ways to measure one segment in isolation (items 6–10)
 - Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
 - NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training (see item 7)
 - Dataloader harness: skip the compute to measure the dataloader's time on its own, and break the startup time down by phase (see item 8)
 - Training-log enhancement: break down the multimodal training loss and locate abnormal input samples (see item 9)
-- Profiler: offline trace, down to modules and operators (see item 10)
+- Enable torch.profiler: break down the overhead by module and operator (see item 10)
 
 **Problem localization**: when you hit a specific symptom, look at the matching metrics to locate the bottleneck:
 
@@ -554,6 +554,52 @@ Note: the identity information is recorded only when a sample triggers the trunc
 
 ---
 
-## 10. Profiler: offline trace, down to modules and operators
+## 10. Enable torch.profiler: break down the overhead by module and operator
 
-To be added.
+**Idea**:
+
+![Four training-step timelines on one millisecond scale: an opaque 1087 ms training-step timer bar; the same training step split by a profiler trace into an unpinned H2D copy, a `torch.linalg.solve` call and the rest; 972 ms after `pin_memory`; 949 ms after the solve is removed, about 140 ms recovered.](assets/05_trainer_profiler_for_an_offline_step_breakdown.png)
+
+Per-step observation of the step time can only locate which segment of the training step is slow; to know which module and which operator it is, a finer granularity is needed. With PyTorch's own `torch.profiler`, labeling the phases of the training step, and reading the trace offline, the parts that can be optimized can be located.
+
+**Implementation**:
+
+Turning on the `trainer.enable_profiler` switch (off by default) enables `torch.profiler` around the training steps. The results are saved under `profiler/` in the output directory, in two kinds: the trace (view it with tensorboard, `tensorboard --logdir=<output dir>/profiler/`) and the distribution of GPU memory over time (html, grouped by model parameters, activations, optimizer state, etc.). Pseudocode:
+
+```python
+# switch: trainer.enable_profiler = true (default false)
+if config.enable_profiler:
+    profiler = torch.profiler.profile(
+        activities=[CPU, CUDA],
+        schedule=schedule(skip_first=1, wait=5, warmup=1, active=3),   # skip the first steps, record only 3 training steps
+        record_shapes=True, profile_memory=True, with_stack=True,
+        on_trace_ready=trace_handler(output_dir / "profiler"),         # save the trace and export the GPU memory distribution over time
+    )
+    profiler.start()
+
+for step in range(max_iter):
+    with record_function("training_step"):    loss = model.training_step(batch)    # label each phase, so that
+    with record_function("backward"):         loss.backward()                      # the trace can attribute time by phase
+    with record_function("optimizer step"):   optimizer.step(); scheduler.step()
+    if config.enable_profiler:
+        profiler.step()                                                            # advance the profiler at the end of every training step
+
+if config.enable_profiler:
+    profiler.stop()
+```
+
+**Experiment data**: (internal data, for reference)
+
+A single trace from one profiler run can break the forward down by component, and can also locate the cost of specific operators.
+
+| Component | Forward time |
+|---|---:|
+| Video tokenizer | 105 ms |
+| Trajectory tokenizer | 1 ms |
+| History tokenizer | 1 ms |
+| Route model | 42 ms |
+| Language model | 235 ms |
+
+Based on the trace, two operator costs were located and fixed (an unpinned H2D copy and one `torch.linalg.solve` call); together the two fixes recovered about 140 ms per training step.
+
+**When to use**: when a segment of the training step is already known to be slow and needs to be attributed further to a specific module or operator.
