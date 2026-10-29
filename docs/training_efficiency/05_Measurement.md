@@ -14,7 +14,7 @@ This chapter covers how to measure and evaluate training efficiency, in the orde
 - Regression test: run a fixed recipe periodically after code changes and compare against baseline thresholds (bands); alert when exceeded (see item 6)
 - NaN / inf gradient forensics: save the scene when one occurs for reproduction and diagnosis, without slowing normal training (see item 7)
 - Dataloader harness: skip the compute to measure the dataloader's time on its own, and break the startup time down by phase (see item 8)
-- Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples (see item 9)
+- Training-log enhancement: break down the multimodal training loss and locate abnormal input samples (see item 9)
 - Profiler: offline trace, down to modules and operators (see item 10)
 
 **Problem localization**: when you hit a specific symptom, look at the matching metrics to locate the bottleneck:
@@ -508,9 +508,49 @@ Note: benchmark mode has no compute, so the dataloader does not compete for CPU 
 
 ---
 
-## 9. Per-component loss and truncation logging: log each loss term separately and keep the identity of truncated samples
+## 9. Training-log enhancement: break down the multimodal training loss and locate abnormal input samples
 
-To be added.
+**Idea**:
+
+![Two before / after panels. A: the total loss 7.79 is one orange bar; split, it becomes two blue components, 6.13 and 1.66, whose sum equals the total. B: a bare orange truncation warning with only a token count becomes the same warning plus blue identity fields (key, source path, clip and sample index, event time, 30 camera timestamps, SHA-256 fingerprint).](assets/05_per_component_loss_and_truncation_logging.png)
+
+- **A: break the loss down, for easier observation**
+  The loss of a multimodal training run is the sum of several terms (here the cross-entropy of the trajectory tokens and the cross-entropy of the text tokens), but the trainer only reports the total, so when the total changes you cannot tell which term changed. As in panel A, the terms in the forward were already computed separately before being summed; now they are also returned as outputs and written to the log. The recorded values are detached and do not take part in backpropagation, so the training result is unchanged.
+- **B: add detail about the input sample, for locating abnormal data**
+  When a sample exceeds the maximum sequence length it is truncated, but the warning only gives the length, so you cannot tell which data it was and cannot locate or replay it. As in panel B, the identity of the sample's source and a fingerprint of its tokens are appended to the existing warning, which both locates the data row and allows an exact replay.
+
+**Implementation**:
+
+- A per-component loss logging: the terms are returned as output fields whose names must not contain "loss" (the trainer folds every output whose name contains "loss" into the backward total), and they are accumulated across micro-batches like the existing auxiliary metrics, so that they stay comparable to the logged total loss under gradient accumulation. The terms sum to the total loss;
+- B truncation identity: append the source fields (key, source path, clip and sample indices, event time), the selected camera indices and timestamps, and a SHA-256 fingerprint of the untruncated token IDs. The source fields locate the data row and frames; the fingerprint is an exact replay check that works even when the dataset has no human-readable identifier; hashing runs only for samples that already triggered the warning.
+
+Illustrative code:
+
+```python
+# A per-component loss logging (forward): the terms are already computed before the sum; returned detached, under names without "loss"
+out.future_traj_ce = traj_ce.detach()     # the name must not contain "loss", or it is folded into the backward total
+out.others_ce      = text_ce.detach()
+loss = traj_w * traj_ce + text_w * text_ce
+
+# B truncation identity (collate): append the identity to the warning when the limit is exceeded
+if n_tokens > max_len:
+    logger.warning("exceeds max length: %d | key=%s src=%s clip=%d sample=%d t=%s "
+                   "cams=%s sha256=%s", n_tokens, key, src, clip_idx, sample_idx,
+                   event_t, cam_ts, sha256(token_ids.numpy().tobytes()).hexdigest())
+```
+
+**Experiment data**: (internal data, for reference)
+
+Configuration: 2B model, 1 node, 40-step smoke test:
+
+| Verification | Check | Result |
+|---|---|---|
+| A per-component loss logging | The sum of the terms vs the recorded total loss | Trajectory 6.13414 + text 1.65791 = 7.79205, which differs from the recorded total loss 7.79205 by 1.2e-7; the terms of a single step can also be inspected, e.g. at step 40 the trajectory cross-entropy is 6.13 and the text cross-entropy is 1.66 |
+| B abnormal-sample logging | Deliberately set the sequence limit to 5,600 and check whether the abnormal sample's information is recorded | A 5,689-token sample was recorded, with its source path, 30 camera-timestamp pairs and the SHA-256 fingerprint of its token IDs |
+
+Note: the identity information is recorded only when a sample triggers the truncation warning. The fingerprint is computed from the token IDs, so it can confirm whether two samples are the same one only while the tokenizer and the prompt template are unchanged; otherwise locate the sample by the source fields.
+
+**When to use**: training that needs per-term loss observation and needs to locate abnormal input samples, especially in production.
 
 ---
 

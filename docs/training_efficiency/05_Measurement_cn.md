@@ -14,7 +14,7 @@
 - 回归测试: 代码改动后定期跑固定配方,与基线阈值（带）对比,超出就报警 (见第 6 项)
 - NaN / inf 梯度取证: 出现时保存现场用于复现和定位,平时不拖慢训练 (见第 7 项)
 - dataloader harness: 跳过 compute 单独计算 dataloader 耗时,并把启动时间拆到各阶段 (见第 8 项)
-- 分项 loss 与截断日志: 各项 loss 分开记,截断样本留身份 (见第 9 项)
+- 训练日志增强: 细化多模态训练 loss,定位异常输入样本 (见第 9 项)
 - profiler: 离线 trace,细到模块和算子 (见第 10 项)
 
 **问题定位**:遇到具体症状时,看对应的指标和瓶颈定位:
@@ -506,9 +506,49 @@ with timed("sampler_init"):  sampler = build_mixture_sampler(ds)   # 给每个�
 
 ---
 
-## 9. 分项 loss 与截断日志: 各项 loss 分开记,截断样本留身份
+## 9. 训练日志增强: 细化多模态训练 loss,定位异常输入样本
 
-待补充。
+**思路**:
+
+![两组改动前后的面板。A：总 loss 7.79 是一根橙色条，拆开后是两根蓝色分项 6.13 与 1.66，它们之和等于总 loss。B：一条只有 token 数的橙色截断告警，变成同一条告警外加蓝色的身份字段（key、源路径、clip 和样本索引、事件时间、30 个相机时间戳、SHA-256 指纹）。](assets/05_per_component_loss_and_truncation_logging.png)
+
+- **A 细化 loss，便于观察**
+  多模态训练的 loss 是若干项之和（这里是 trajectory token 的交叉熵和文本 token 的交叉熵），而 trainer 只报总数，总 loss 变化时，看不出是哪一项变了。如图 A，forward 里各项 loss 本来就是先单独算出来、再求和的，现在把它们也作为输出记录到日志里。记录的是 detach 之后的值，不参与反向传播，所以训练结果不变。
+- **B 细化输入样本信息，便于定位异常数据**
+  样本超过最大序列长度时会被截断，但告警里只有长度，不知道是哪条数据，无法定位或重放。如图 B，在已有的告警后面追加这条样本的来源身份和 token 的指纹，既能定位到数据行，也能精确重放。
+
+**实现**:
+
+- A 分项日志：各项作为输出字段返回，名字里不能含 "loss"（trainer 会把名字含 "loss" 的输出都折进 backward 的总数）；并像已有的辅助指标一样跨 micro-batch 累加，使它们在梯度累积下与记录的总 loss 保持可比。各项之和等于总 loss；
+- B 截断身份：追加来源字段（key、源路径、clip 与样本索引、事件时间）、所选相机的索引和时间戳，以及未截断 token ID 的 SHA-256 指纹。来源字段用于定位数据行和帧，指纹是精确的 replay 检查，即使数据集没有人类可读的标识也有效；哈希只对已触发告警的样本运行。
+
+示意代码：
+
+```python
+# A 分项日志（forward）：各项在求和前已经算出；以不含 "loss" 的名字、detach 后返回
+out.future_traj_ce = traj_ce.detach()     # 名字里不能有 "loss"，否则会被折进 backward 的总数
+out.others_ce      = text_ce.detach()
+loss = traj_w * traj_ce + text_w * text_ce
+
+# B 截断身份（collate）：超限时在告警后追加身份
+if n_tokens > max_len:
+    logger.warning("exceeds max length: %d | key=%s src=%s clip=%d sample=%d t=%s "
+                   "cams=%s sha256=%s", n_tokens, key, src, clip_idx, sample_idx,
+                   event_t, cam_ts, sha256(token_ids.numpy().tobytes()).hexdigest())
+```
+
+**实验数据**:(内部数据供参考)
+
+配置：2B 模型，1 节点，40 步 smoke test：
+
+| 验证项 | 检查 | 结果 |
+|---|---|---|
+| A 分项 loss 日志 | 各项 loss 之和 vs 记录的总 loss | trajectory 6.13414 + 文本 1.65791 = 7.79205，与记录的总 loss 7.79205 相差 1.2e-7；还可以单独查看某一步的各项 loss，例如第 40 步 trajectory 交叉熵 6.13，文本交叉熵 1.66 |
+| B 异常样本日志 | 故意把序列上限设成 5,600，检查能否记录异常样本的信息 | 记录了一个 5,689 token 的样本，带有它的源路径、30 个相机-时间戳对和 token ID 的 SHA-256 指纹 |
+
+说明：只有样本触发了截断告警，才会记录身份信息。指纹由 token ID 计算得到，所以只有在 tokenizer 和 prompt 模板不变时，才能用它确认是不是同一条样本；否则请用来源字段定位。
+
+**适用场景**：需要分项观察 loss、需要定位异常输入样本的训练，尤其是生产环境。
 
 ---
 
